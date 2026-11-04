@@ -5,14 +5,16 @@ Handlers for regular User-role commands: /start and /plan.
 
 from __future__ import annotations
 
+import asyncio
+
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import CommandHandler, ContextTypes, MessageHandler, filters
 
-from bot.config import SUPER_ADMIN_ID, TRIAL_DAYS
+from bot.config import TRIAL_DAYS
 from bot.db import users as users_db
 from bot.db.content import get_content
 from bot.db import referrals as ref_db
@@ -72,7 +74,7 @@ def _get_free_user_keyboard() -> ReplyKeyboardMarkup:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Register user, handle referral deep link, show status."""
     tg_user = update.effective_user
-    user = users_db.get_or_create_user(tg_user.id, tg_user.username)
+    user = (await asyncio.to_thread(users_db.get_or_create_user, tg_user.id, tg_user.username))
     role = user["role"]
 
     # ── Handle referral deep link: /start ref_<referrer_id> ──────────────
@@ -83,8 +85,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 referrer_id = int(payload[4:])
                 # Only record if this is a new user (no existing referral) and not self-referral
                 if referrer_id != tg_user.id and not user.get("referred_by"):
-                    ref_db.record_referral(referrer_id, tg_user.id)
-                    users_db.save_referred_by(tg_user.id, referrer_id)
+                    (await asyncio.to_thread(ref_db.record_referral, referrer_id, tg_user.id))
+                    (await asyncio.to_thread(users_db.save_referred_by, tg_user.id, referrer_id))
             except (ValueError, Exception) as e:
                 logger.debug("Referral parse error: %s", e)
 
@@ -125,7 +127,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         days_left = max(0, (sub_end - datetime.now(timezone.utc)).days) if sub_end else 0
 
         # Check if userbot is authorized
-        if not userbot_manager.is_userbot_authorized(tg_user.id):
+        if not (await asyncio.to_thread(userbot_manager.is_userbot_authorized, tg_user.id)):
             await update.message.reply_text(
                 f"<b>{check_green} Welcome, Admin! {crown_emoji}</b>\n\n"
                 f"📅 Subscription expires: <code>{sub_end.strftime('%Y-%m-%d') if sub_end else 'N/A'}</code>\n"
@@ -172,9 +174,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     # Regular user — show greeting, all admin commands, and premium call-to-action
-    sa_uname = _get_superadmin_username()
     first_name = tg_user.first_name or "User"
-    
+
     default_text = (
         f"<b>{crown_emoji} Welcome {first_name} to the Auto Forward Bot!</b>\n\n"
         f"{check_green} <b>Start Here:</b> Send /help to see step-by-step image tutorials on how to use the bot!\n\n"
@@ -192,9 +193,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"<b>{yellow_emoji} Paid Plan Needed:</b>\n"
         f"To activate real-time channel forwarding, please use /pro to purchase a plan and activate your account!"
     )
-    
-    text = get_content("welcome_msg", default_text).replace("{first_name}", first_name)
-    
+
+    text = (await asyncio.to_thread(get_content, "welcome_msg", default_text)).replace("{first_name}", first_name)
+
     image_path = IMAGES_DIR / "welcome.png"
     if image_path.exists():
         with open(image_path, "rb") as photo:
@@ -210,7 +211,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show current plan and trial/subscription status."""
     tg_user = update.effective_user
-    user = users_db.get_or_create_user(tg_user.id, tg_user.username)
+    user = (await asyncio.to_thread(users_db.get_or_create_user, tg_user.id, tg_user.username))
     role = user["role"]
 
     if role == "superadmin":
@@ -240,7 +241,7 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Free user
     trial_start = user.get("trial_start")
-    days_left = users_db.get_trial_days_remaining(trial_start) if trial_start else 0
+    days_left = (await asyncio.to_thread(users_db.get_trial_days_remaining, trial_start)) if trial_start else 0
     active = days_left > 0
 
     status_icon = check_emoji if active else "❌"
@@ -250,8 +251,8 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Status: {status_icon} <b>{'Active' if active else 'Expired'}</b>\n"
         f"Days remaining: <b>{days_left}</b> / {TRIAL_DAYS}\n\n"
         + (
-            f"Please use /pro to view subscription plans and upgrade." if not active else
-            f"Your trial is active. Please use /pro to view subscription plans and upgrade to a paid plan."
+            "Please use /pro to view subscription plans and upgrade." if not active else
+            "Your trial is active. Please use /pro to view subscription plans and upgrade to a paid plan."
         ),
         parse_mode="HTML",
     )
@@ -260,17 +261,6 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _get_superadmin_username() -> str:
-    """Try to fetch the superadmin's username from DB, fallback to 'superadmin'."""
-    try:
-        user = users_db.get_user(SUPER_ADMIN_ID)
-        if user and user.get("username"):
-            return user["username"]
-    except Exception:
-        pass
-    return "superadmin"
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Handler registration
@@ -296,7 +286,7 @@ async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     user_id = update.effective_user.id
     # Check if userbot is authorized
-    if not userbot_manager.is_userbot_authorized(user_id):
+    if not (await asyncio.to_thread(userbot_manager.is_userbot_authorized, user_id)):
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔐 Login Now", callback_data="auth_login")]
         ])

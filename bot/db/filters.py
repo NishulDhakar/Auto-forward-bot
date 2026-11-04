@@ -5,7 +5,6 @@ Database operations for the `filters` table.
 
 from __future__ import annotations
 
-from typing import Optional
 
 from bot.db.supabase_client import get_client
 
@@ -28,13 +27,13 @@ def get_filters(admin_id: int) -> list[dict]:
     return res.data or []
 
 
-def remove_filter(filter_id: str) -> bool:
+def remove_filter(filter_id: str, admin_id: int) -> bool:
     """Delete a filter by its UUID. Returns True if deleted."""
     db = get_client()
-    res = db.table("filters").select("id").eq("id", filter_id).execute()
+    res = db.table("filters").select("id").eq("id", filter_id).eq("admin_id", admin_id).execute()
     if not res.data:
         return False
-    db.table("filters").delete().eq("id", filter_id).execute()
+    db.table("filters").delete().eq("id", filter_id).eq("admin_id", admin_id).execute()
     return True
 
 

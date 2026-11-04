@@ -52,6 +52,8 @@ def record_referral(referrer_id: int, referred_id: int) -> bool:
     Save a new referral relationship. Returns True if saved, False if already exists.
     The referred_id has a UNIQUE constraint so duplicate joins are safely ignored.
     """
+    if referrer_id == referred_id or referrer_id <= 0 or referred_id <= 0:
+        return False
     try:
         db = get_client()
         db.table("referrals").insert({

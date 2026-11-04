@@ -1,192 +1,153 @@
-"""
-bot/handlers/forwarding.py
-Core forwarding engine — listens on source channels and copies messages
-to all target channels, applying admin-defined text filters first.
-
-How it works:
-1. A MessageHandler catches all channel_post updates (messages posted in channels).
-2. We look up which admins have this channel as their source.
-3. For each such admin:
-   a. Apply their text filters to the message text/caption.
-   b. copy_message() to each of their target channels.
-      (copy_message avoids the "Forwarded from" header and lets us inject
-       a custom caption with filters applied.)
-
-Supported types: text, photo, video, audio, document, sticker, animation,
-                 voice, video_note, poll, contact, location, venue.
-"""
-
+"""Bot API forwarding with cached rules, album collection and bounded delivery."""
 from __future__ import annotations
 
+import asyncio
 import logging
-
-from telegram import Message, Update
+from telegram import Message, Update, InputMediaPhoto, InputMediaVideo, InputMediaAudio, InputMediaDocument
 from telegram.ext import ContextTypes, MessageHandler, filters
-
-from bot.db.channels import get_admins_by_source_channel, get_target_channels
-from bot.utils.filters import apply_filters, should_block_apk
+from bot.db.channels import get_admins_by_source_channel
+from bot.utils import userbot_manager
+from bot.utils.delivery import send_with_retry
+from bot.utils.formatting import to_bot_entities
 
 logger = logging.getLogger(__name__)
+_dispatcher = userbot_manager._dispatcher
+_albums: dict[tuple, list[Message]] = {}
+_album_tasks: dict[tuple, asyncio.Task] = {}
 
 
 async def forward_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Entry point for all channel posts.
-    Called whenever a message is posted in any channel the bot is a member of.
-    """
-    msg: Message | None = update.channel_post
+    msg = update.channel_post
     if msg is None:
         return
-
-    source_channel_id = msg.chat.id
-
-    # Find all admins that have this channel as source
-    admin_ids = get_admins_by_source_channel(source_channel_id)
-    if not admin_ids:
-        return  # This channel isn't a registered source for any admin
-
-    from bot.utils import userbot_manager
-    for admin_id in admin_ids:
-        # Check if bot is stopped for this admin
-        is_working = await userbot_manager.is_admin_working(admin_id)
-        if not is_working:
-            logger.debug("Skipping Bot API forwarding for admin %s since bot is stopped (/stop).", admin_id)
-            continue
-
-        # If userbot session is active, let it handle forwarding to prevent double posts
-        if userbot_manager.is_userbot_authorized(admin_id):
-            logger.debug("Skipping Bot API forwarding for admin %s since userbot is active.", admin_id)
-            continue
-        await _forward_for_admin(context, msg, admin_id)
+    if msg.media_group_id:
+        key = (msg.chat.id, msg.media_group_id)
+        if key not in _albums:
+            _albums[key] = []
+            _album_tasks[key] = asyncio.create_task(_collect_album(key, context))
+        _albums[key].append(msg)
+    else:
+        await _dispatch(context, [msg])
 
 
-async def _forward_for_admin(context, msg: Message, admin_id: int) -> None:
-    """Apply filters and forward to all of an admin's target channels."""
-    targets = get_target_channels(admin_id)
-    if not targets:
-        logger.debug("Admin %s has no target channels; skipping forward.", admin_id)
-        return
-
-    # Check for APK block
-    if msg.document and msg.document.file_name and msg.document.file_name.lower().endswith('.apk'):
-        if should_block_apk(admin_id):
-            logger.debug("Blocking APK file for admin %s", admin_id)
-            return
-
-    # Determine filtered text / caption
-    original_text = msg.text or None
-    original_caption = msg.caption or None
-
-    filtered_text = apply_filters(admin_id, original_text)
-    filtered_caption = apply_filters(admin_id, original_caption)
-
-    for target in targets:
-        target_id = target["channel_id"]
-        try:
-            if msg.text:
-                # Pure text message — send as new message so we can inject filtered text
-                await context.bot.send_message(
-                    chat_id=target_id,
-                    text=filtered_text or msg.text,
-                    entities=msg.entities if filtered_text == original_text else None,
-                    parse_mode=None,
-                )
-            elif _has_media(msg):
-                # Media with optional caption — use copy_message but override caption
-                if filtered_caption != original_caption:
-                    # Caption was modified by filters; send media separately with new caption
-                    await _send_media_with_caption(context.bot, target_id, msg, filtered_caption)
-                else:
-                    # No filter changes — simple copy preserves formatting
-                    await context.bot.copy_message(
-                        chat_id=target_id,
-                        from_chat_id=msg.chat.id,
-                        message_id=msg.message_id,
-                    )
-            else:
-                # Fallback: copy as-is (poll, contact, location, venue, etc.)
-                await context.bot.copy_message(
-                    chat_id=target_id,
-                    from_chat_id=msg.chat.id,
-                    message_id=msg.message_id,
-                )
-
-        except Exception as exc:
-            logger.error(
-                "Failed to forward msg %s from channel %s to %s (admin %s): %s",
-                msg.message_id, msg.chat.id, target_id, admin_id, exc,
-            )
-
-
-async def _send_media_with_caption(bot, target_id: int, msg: Message, caption: str | None) -> None:
-    """
-    Re-send a media message to a target channel with an overridden caption.
-    Handles each media type individually to support caption replacement.
-    """
-    kwargs = {
-        "chat_id": target_id,
-        "caption": caption,
-        "parse_mode": None,
-    }
-
+async def _collect_album(key, context):
     try:
-        if msg.photo:
-            file_id = msg.photo[-1].file_id  # Largest resolution
-            await bot.send_photo(photo=file_id, **kwargs)
-        elif msg.video:
-            await bot.send_video(video=msg.video.file_id, **kwargs)
-        elif msg.audio:
-            await bot.send_audio(audio=msg.audio.file_id, **kwargs)
-        elif msg.document:
-            await bot.send_document(document=msg.document.file_id, **kwargs)
-        elif msg.animation:
-            await bot.send_animation(animation=msg.animation.file_id, **kwargs)
-        elif msg.voice:
-            await bot.send_voice(voice=msg.voice.file_id, **kwargs)
-        elif msg.video_note:
-            # video_notes don't support captions
-            await bot.send_video_note(video_note=msg.video_note.file_id, chat_id=target_id)
-        elif msg.sticker:
-            # stickers don't support captions
-            await bot.send_sticker(sticker=msg.sticker.file_id, chat_id=target_id)
-        else:
-            # Unknown media — copy as-is
-            await bot.copy_message(
-                chat_id=target_id,
-                from_chat_id=msg.chat.id,
-                message_id=msg.message_id,
-            )
-    except Exception as exc:
-        logger.error("_send_media_with_caption failed for target %s: %s", target_id, exc)
+        await asyncio.sleep(1)
+        await _dispatch(context, sorted(_albums.pop(key), key=lambda msg: msg.message_id))
+    except Exception:
+        logger.exception("Failed to collect album %r", key)
+    finally:
+        _albums.pop(key, None)
+        _album_tasks.pop(key, None)
 
 
-def _has_media(msg: Message) -> bool:
-    """Return True if the message contains any media type."""
-    return bool(
-        msg.photo
-        or msg.video
-        or msg.audio
-        or msg.document
-        or msg.animation
-        or msg.sticker
-        or msg.voice
-        or msg.video_note
-    )
+async def _dispatch(context, messages):
+    source_id = messages[0].chat.id
+    admin_ids = await asyncio.to_thread(get_admins_by_source_channel, source_id)
+    for admin_id in admin_ids:
+        # A saved session isn't proof that its listener is actually running.
+        if userbot_manager.is_userbot_running(admin_id):
+            continue
+        group = messages[0].media_group_id
+        key = ((source_id, 'album', str(group)) if group
+               else (source_id, 'message', messages[0].message_id))
+        await _dispatcher.submit(admin_id, key,
+                                 lambda aid=admin_id: _forward_for_admin(context, messages, aid))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Handler registration
-# ─────────────────────────────────────────────────────────────────────────────
+def _filtered(msg, rules):
+    """Use the same UTF-16 entity-preserving filter engine as Telethon."""
+    from telethon import types
+    reverse = {
+        'bold': types.MessageEntityBold, 'italic': types.MessageEntityItalic,
+        'underline': types.MessageEntityUnderline, 'strikethrough': types.MessageEntityStrike,
+        'code': types.MessageEntityCode, 'spoiler': types.MessageEntitySpoiler,
+        'url': types.MessageEntityUrl, 'mention': types.MessageEntityMention,
+        'hashtag': types.MessageEntityHashtag, 'cashtag': types.MessageEntityCashtag,
+        'bot_command': types.MessageEntityBotCommand, 'email': types.MessageEntityEmail,
+        'phone_number': types.MessageEntityPhone,
+    }
+    text = msg.text if msg.text is not None else msg.caption or ''
+    original = msg.entities if msg.text is not None else msg.caption_entities
+    entities = []
+    for entity in original or []:
+        args = (entity.offset, entity.length)
+        if entity.type == 'text_link':
+            entities.append(types.MessageEntityTextUrl(*args, entity.url))
+        elif entity.type == 'pre':
+            entities.append(types.MessageEntityPre(*args, entity.language or ''))
+        elif entity.type == 'custom_emoji':
+            entities.append(types.MessageEntityCustomEmoji(*args, int(entity.custom_emoji_id)))
+        elif entity.type in ('blockquote', 'expandable_blockquote'):
+            # Telethon 1.38 models regular blockquotes only.
+            entities.append(types.MessageEntityBlockquote(*args))
+        elif entity.type in reverse:
+            entities.append(reverse[entity.type](*args))
+    original_text = text
+    original_entities = [entity.to_dict() for entity in entities]
+    text, entities = userbot_manager._apply_cached_filters_with_entities(rules, text, entities)
+    if text == original_text and [entity.to_dict() for entity in entities] == original_entities:
+        return text, list(original or [])
+    return text, to_bot_entities(entities)
 
-def register(application) -> None:
-    """
-    Register the channel post forwarding handler.
-    Must be registered LAST so ConversationHandlers take priority for DM commands.
-    """
-    application.add_handler(
-        MessageHandler(
-            filters.ChatType.CHANNEL & filters.UpdateType.CHANNEL_POST,
-            forward_channel_post,
-        ),
-        group=1,  # Lower priority group — runs after all DM conversation handlers
-    )
+
+async def _forward_for_admin(context, messages, admin_id: int) -> None:
+    if not await userbot_manager.is_admin_working(admin_id):
+        return
+    targets = await userbot_manager._get_cached_targets(admin_id)
+    rules = await userbot_manager._get_cached_filters(admin_id)
+    prepared = []
+    for msg in messages:
+        if msg.document and (msg.document.file_name or '').lower().endswith('.apk'):
+            if any(r['find_text'] == '<BLOCK_APK>' for r in rules):
+                return
+        text, entities = _filtered(msg, rules)
+        if text is None:
+            return  # None means blocked; an empty string means deliberate deletion.
+        prepared.append((msg, text, entities))
+
+    async def deliver(target):
+        tid = target['channel_id']
+        if tid == messages[0].chat.id:
+            return
+        async def send():
+            if len(prepared) > 1:
+                media = []
+                for msg, text, entities in prepared:
+                    obj, kind = ((msg.photo[-1], InputMediaPhoto) if msg.photo else
+                                 (msg.video, InputMediaVideo) if msg.video else
+                                 (msg.audio, InputMediaAudio) if msg.audio else (msg.document, InputMediaDocument))
+                    if obj is None:
+                        raise ValueError('Unsupported album media')
+                    media.append(kind(obj.file_id, caption=text, caption_entities=entities, parse_mode=None))
+                await context.bot.send_media_group(chat_id=tid, media=media)
+            else:
+                msg, text, entities = prepared[0]
+                if msg.text is not None:
+                    if text:
+                        await context.bot.send_message(chat_id=tid, text=text, entities=entities, parse_mode=None)
+                else:
+                    await context.bot.copy_message(chat_id=tid, from_chat_id=msg.chat.id,
+                                                   message_id=msg.message_id, caption=text,
+                                                   caption_entities=entities, parse_mode=None)
+        await send_with_retry(send)
+
+    # Bound fan-out for this account; don't create unbounded target tasks.
+    errors = []
+    for offset in range(0, len(targets), 8):
+        results = await asyncio.gather(*(deliver(t) for t in targets[offset:offset+8]), return_exceptions=True)
+        errors.extend(r for r in results if isinstance(r, BaseException))
+    if errors:
+        raise RuntimeError(f'{len(errors)} target deliveries failed: {errors[0]}')
+
+
+async def stop_forwarding():
+    if _album_tasks:
+        await asyncio.gather(*list(_album_tasks.values()), return_exceptions=True)
+    for admin_id in list(_dispatcher.workers):
+        await _dispatcher.stop(admin_id)
+
+
+def register(application):
+    application.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.UpdateType.CHANNEL_POST,
+                                           forward_channel_post), group=1)

@@ -3,7 +3,7 @@ bot/main.py
 Bot entry point — wires everything together and starts polling.
 
 Startup sequence:
-1. Acquire PID lock (kills any stale duplicate instance automatically)
+1. Acquire an exclusive process lock
 2. Build the PTB Application
 3. Register all handlers (superadmin → admin → user → forwarding)
 4. On post_init: start APScheduler, bootstrap DB schedules, register expiry checker
@@ -15,7 +15,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
-import signal
+import fcntl
 import sys
 
 # Ensure the parent directory is in sys.path to allow absolute imports
@@ -49,25 +49,29 @@ logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PID lock — prevents two bot instances from running simultaneously.
-# A second "Conflict: terminated by other getUpdates request" can never occur.
+# Prevent duplicate local instances; deploy only one replica for polling.
 # ─────────────────────────────────────────────────────────────────────────────
 _PID_FILE = os.path.join(os.path.dirname(__file__), "..", ".bot.pid")
 
 
+_pid_handle = None
+
+
 def _acquire_pid_lock() -> None:
-    """Write our PID to .bot.pid, killing any stale previous instance first."""
-    pid_file = os.path.abspath(_PID_FILE)
-    if os.path.exists(pid_file):
-        try:
-            old_pid = int(open(pid_file).read().strip())
-            os.kill(old_pid, signal.SIGTERM)
-            logger.warning("Killed stale bot instance PID %s", old_pid)
-            import time; time.sleep(1)  # Give it a moment to die
-        except (ValueError, ProcessLookupError, PermissionError):
-            pass  # PID file stale or process already dead
-    with open(pid_file, "w") as f:
-        f.write(str(os.getpid()))
-    atexit.register(lambda: os.path.exists(pid_file) and os.remove(pid_file))
+    """Refuse a duplicate process; never kill a PID read from a stale file."""
+    global _pid_handle
+    _pid_handle = open(os.path.abspath(_PID_FILE), "a+")
+    try:
+        fcntl.flock(_pid_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        _pid_handle.close()
+        raise SystemExit("Another bot instance is already running.")
+    _pid_handle.seek(0)
+    _pid_handle.truncate()
+    _pid_handle.write(str(os.getpid()))
+    _pid_handle.flush()
+    # Leave the inode in place: unlinking a lock file creates acquisition races.
+    atexit.register(_pid_handle.close)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,7 +94,7 @@ async def post_init(application: Application) -> None:
     start_scheduler()
 
     # Reload all saved scheduled messages from DB into APScheduler
-    bootstrap_schedules(bot)
+    await bootstrap_schedules(bot)
 
     # Register hourly subscription expiry checker
     start_expiry_checker(bot)
@@ -107,10 +111,13 @@ async def post_init(application: Application) -> None:
     logger.info("All handlers registered. Polling...")
 
 
-async def post_shutdown(application: Application) -> None:
+async def post_stop(application: Application) -> None:
     """Called during application shutdown. Gracefully stop all background services."""
+    from bot.utils.scheduler import stop_scheduler
+    stop_scheduler()
     logger.info("Stopping all background userbot sessions...")
     await userbot_manager.stop_all_userbots()
+    await forwarding.stop_forwarding()
     await stop_webhook_server()
 
 
@@ -121,10 +128,10 @@ async def post_shutdown(application: Application) -> None:
 async def global_error_handler(update, context) -> None:
     """Log errors globally and prevent the bot from crashing."""
     logger.error("Exception while handling an update:", exc_info=context.error)
-    # If it's a network timeout, we can silently ignore it as PTB will retry
+    # Outbound sends may have succeeded before a timeout; never blindly replay.
     from telegram.error import TimedOut, NetworkError
     if isinstance(context.error, (TimedOut, NetworkError)):
-        logger.warning("Network timeout occurred, ignoring to keep bot alive.")
+        logger.warning("Network error; delivery outcome may be unknown.")
 
 
 def build_application() -> Application:
@@ -136,7 +143,7 @@ def build_application() -> Application:
         .read_timeout(30.0)
         .write_timeout(30.0)
         .post_init(post_init)
-        .post_shutdown(post_shutdown)
+        .post_stop(post_stop)
         .build()
     )
 
@@ -174,7 +181,7 @@ def build_application() -> Application:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    _acquire_pid_lock()  # Kill any stale duplicate instance before starting
+    _acquire_pid_lock()
     app = build_application()
 
     logger.info("Starting Telegram forwarding bot...")
@@ -186,7 +193,7 @@ def main() -> None:
             "edited_channel_post",
             "callback_query",
         ],
-        drop_pending_updates=True,
+        drop_pending_updates=False,
     )
 
 

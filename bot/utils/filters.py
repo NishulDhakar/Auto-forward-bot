@@ -19,7 +19,7 @@ def apply_filters(admin_id: int, text: str | None) -> str | None:
         return None
 
     rules = get_filters(admin_id)
-    
+
     # Process blocking rules first
     for rule in rules:
         if rule["find_text"] == "<BLOCK>":
@@ -32,10 +32,10 @@ def apply_filters(admin_id: int, text: str | None) -> str | None:
         replace = rule["replace_text"]
         if find == "<ALL_LINKS>":
             # Match standard URLs, www, and t.me links
-            text = re.sub(r'https?://\S+|www\.\S+|t\.me/\S+', replace, text)
+            text = re.sub(r'https?://\S+|www\.\S+|t\.me/\S+', lambda _: replace, text)
         elif find == "<ALL_USERNAMES>":
             # Match Telegram usernames starting with @
-            text = re.sub(r'@[a-zA-Z0-9_]+', replace, text)
+            text = re.sub(r'@[a-zA-Z0-9_]+', lambda _: replace, text)
 
     # Process standard exact match rules
     for rule in rules:

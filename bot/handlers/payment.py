@@ -11,7 +11,8 @@ Handles the full /pro premium subscription flow:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+import asyncio
+from datetime import datetime, timezone
 from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -20,8 +21,6 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, Mes
 from bot.config import RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, SUPER_ADMIN_ID
 from bot.db import subscriptions as subs_db
 from bot.db import users as users_db
-from bot.db import referrals as ref_db
-from bot.db.transactions import log_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -46,29 +45,7 @@ box_emoji = "<tg-emoji emoji-id='5884479287171485878'>🔲</tg-emoji>"
 # Plan definitions
 # ─────────────────────────────────────────────────────────────────────────────
 
-PLANS = {
-    "1_month": {
-        "label": "1 Month",
-        "inr": 88,
-        "usdt": 2,
-        "days": 30,
-        "per_day_inr": "₹2.9/day",
-    },
-    "3_months": {
-        "label": "3 Months",
-        "inr": 250,
-        "usdt": 5,
-        "days": 90,
-        "per_day_inr": "₹2.7/day",
-    },
-    "6_months": {
-        "label": "6 Months",
-        "inr": 500,
-        "usdt": 10,
-        "days": 180,
-        "per_day_inr": "₹2.7/day",
-    },
-}
+from bot.payment_plans import PLANS
 
 # USDT wallet addresses
 USDT_BEP20 = "0x565f64c9edc74e60ae4ca24c816b25d10dd9bdf6"
@@ -127,50 +104,26 @@ def _create_razorpay_link(plan_key: str, user_id: int) -> tuple[Optional[str], O
         return None, None
 
 
-def _check_razorpay_payment(payment_link_id: str) -> bool:
-    """
-    Check if a Razorpay Payment Link has been paid.
-    Returns True if status == 'paid'.
-    """
+def _check_razorpay_payment(payment_link_id: str, user_id: int, plan_key: str) -> dict | None:
+    """Verify ownership, pricing and captured payment directly with Razorpay."""
     client = _get_razorpay_client()
-    if not client or not payment_link_id:
-        return False
-    try:
-        resp = client.payment_link.fetch(payment_link_id)
-        status = resp.get("status", "")
-        logger.info("Razorpay payment link %s status: %s", payment_link_id, status)
-        return status == "paid"
-    except Exception as exc:
-        logger.error("Razorpay payment check failed for %s: %s", payment_link_id, exc)
-        return False
-
-
-def _activate_user(user_id: int, plan_key: str, amount: float, method: str) -> datetime:
-    """
-    Make the user an admin with the correct subscription dates.
-    Returns the expiry datetime.
-    """
-    plan = PLANS[plan_key]
-    now = _now()
-    expires_at = now + timedelta(days=plan["days"])
-
-    users_db.set_subscription(
-        user_id=user_id,
-        plan=plan_key,
-        start_dt=now,
-        end_dt=expires_at,
-        payment_method=method,
-        amount=amount,
-        payment_status="paid",
-    )
-    log_transaction(user_id, amount, plan["days"], now, expires_at)
-
-    # Credit referral earnings if this user was referred by someone
-    earned = ref_db.credit_referral(user_id)
-    if earned:
-        logger.info("Referral credit: user %s converted to Pro, referrer earned ₹%.2f", user_id, earned)
-
-    return expires_at
+    if not client:
+        return None
+    link = client.payment_link.fetch(payment_link_id)
+    notes = link.get("notes") or {}
+    if (link.get("status") != "paid" or link.get("currency") != "INR"
+        or link.get("amount") != PLANS[plan_key]["inr"] * 100
+        or str(notes.get("telegram_id")) != str(user_id) or notes.get("plan") != plan_key):
+        return None
+    for item in link.get("payments", []):
+        payment_id = item.get("payment_id")
+        if not payment_id:
+            continue
+        payment = client.payment.fetch(payment_id)
+        if (payment.get("status") == "captured" and payment.get("currency") == "INR"
+            and payment.get("amount") == PLANS[plan_key]["inr"] * 100):
+            return payment
+    return None
 
 
 def _build_plans_keyboard() -> InlineKeyboardMarkup:
@@ -216,7 +169,7 @@ _PLANS_TEXT = (
 async def pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the premium membership plan selection UI."""
     tg_user = update.effective_user
-    user = users_db.get_or_create_user(tg_user.id, tg_user.username)
+    user = (await asyncio.to_thread(users_db.get_or_create_user, tg_user.id, tg_user.username))
 
     if user["role"] in ("admin", "superadmin"):
         sub_end_str = user.get("subscription_end")
@@ -308,16 +261,16 @@ async def pay_inr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     plan = PLANS[plan_key]
     user_id = query.from_user.id
 
-    payment_url, payment_link_id = _create_razorpay_link(plan_key, user_id)
+    payment_url, payment_link_id = (await asyncio.to_thread(_create_razorpay_link, plan_key, user_id))
 
     # Store pending record — with razorpay link ID if available
-    subs_db.create_subscription_record(
+    (await asyncio.to_thread(subs_db.create_subscription_record,
         telegram_id=user_id,
         plan_name=plan_key,
         amount=plan["inr"],
         payment_method="inr",
         razorpay_order_id=payment_link_id,  # None if no Razorpay keys
-    )
+    ))
 
     if payment_url and payment_link_id:
         # Razorpay available — show payment link + auto-verify button
@@ -376,12 +329,12 @@ async def pay_usdt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     username = query.from_user.username or str(user_id)
 
     # Store pending record for USDT
-    subs_db.create_subscription_record(
+    (await asyncio.to_thread(subs_db.create_subscription_record,
         telegram_id=user_id,
         plan_name=plan_key,
         amount=plan["usdt"],
         payment_method="usdt",
-    )
+    ))
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"💬 Contact {SUPPORT_USERNAME}", url="https://t.me/savvyop")],
@@ -439,21 +392,15 @@ async def paid_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # ── Case 1: Razorpay available with a real link ID ─────────────────────
     if payment_link_id and payment_link_id != "none" and _razorpay_available():
-        is_paid = _check_razorpay_payment(payment_link_id)
+        payment = await asyncio.to_thread(_check_razorpay_payment, payment_link_id, user_id, plan_key)
 
-        if is_paid:
-            # ✅ Payment confirmed — auto-activate
-            expires_at = _activate_user(
-                user_id=user_id,
-                plan_key=plan_key,
-                amount=float(plan["inr"]),
-                method="inr",
-            )
-
-            # Update DB subscription record
-            pending = subs_db.get_pending_subscription_by_user(user_id)
-            if pending:
-                subs_db.activate_subscription(pending["id"], expires_at)
+        if payment:
+            # The button and webhook share the same payment-ID transaction.
+            result = await asyncio.to_thread(subs_db.activate_razorpay_payment,
+                payment["id"], user_id, plan_key, payment["amount"], payment_link_id)
+            expires_at = datetime.fromisoformat(result["expires_at"])
+            from bot.utils.userbot_manager import invalidate_cache
+            invalidate_cache(user_id)
 
             await query.edit_message_text(
                 f"🎉 <b>Payment Successful!</b>\n\n"
@@ -493,11 +440,11 @@ async def paid_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # ── Case 2: No Razorpay / UPI manual flow ──────────────────────────────
     # Check DB for an existing paid subscription record
-    pending = subs_db.get_pending_subscription_by_user(user_id)
+    pending = (await asyncio.to_thread(subs_db.get_pending_subscription_by_user, user_id))
 
     if pending and pending.get("payment_status") == "paid":
         # Already activated by admin previously — just confirm
-        user = users_db.get_user(user_id)
+        user = (await asyncio.to_thread(users_db.get_user, user_id))
         sub_end_str = user.get("subscription_end") if user else None
         sub_end = datetime.fromisoformat(sub_end_str) if sub_end_str else None
         if sub_end and sub_end.tzinfo is None:

@@ -6,14 +6,14 @@ Shows referral stats, earnings, referral link, and withdrawal info.
 
 from __future__ import annotations
 
+import asyncio
+
 import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CommandHandler, ContextTypes, MessageHandler, filters
 
 from bot.db import referrals as ref_db
-from bot.db import users as users_db
-from bot.config import SUPER_ADMIN_ID
 
 logger = logging.getLogger(__name__)
 
@@ -40,15 +40,16 @@ async def refer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     tg_user = update.effective_user
     user_id = tg_user.id
 
-    stats = ref_db.get_referral_stats(user_id)
-    payout = ref_db.get_referral_payout_amount()
-    min_withdrawal = ref_db.get_min_withdrawal()
+    stats = (await asyncio.to_thread(ref_db.get_referral_stats, user_id))
+    payout = (await asyncio.to_thread(ref_db.get_referral_payout_amount))
+    min_withdrawal = (await asyncio.to_thread(ref_db.get_min_withdrawal))
 
     total = stats["total_referrals"]
     pro = stats["pro_referrals"]
     earned = stats["total_earned"]
 
-    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+    bot_username = context.bot.username or (await context.bot.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
 
     # Withdrawal status
     if earned >= min_withdrawal:
@@ -101,8 +102,8 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     tg_user = update.effective_user
     user_id = tg_user.id
 
-    stats = ref_db.get_referral_stats(user_id)
-    min_withdrawal = ref_db.get_min_withdrawal()
+    stats = (await asyncio.to_thread(ref_db.get_referral_stats, user_id))
+    min_withdrawal = (await asyncio.to_thread(ref_db.get_min_withdrawal))
     earned = stats["total_earned"]
 
     if earned >= min_withdrawal:
@@ -146,7 +147,8 @@ async def refer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await withdraw_command(update, context)
     elif query.data == "refer_show_link":
         user_id = query.from_user.id
-        ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+        bot_username = context.bot.username or (await context.bot.get_me()).username
+        ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
         await query.message.reply_text(
             f"🔗 <b>Your Referral Link:</b>\n<code>{ref_link}</code>",
             parse_mode="HTML",

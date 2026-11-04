@@ -38,7 +38,6 @@ from bot.db import users as users_db
 from bot.db.transactions import log_transaction
 from bot.db.users import (
     get_active_subscriptions,
-    get_all_users,
     get_expiring_soon_admins,
     get_expired_admins,
     set_subscription,
@@ -77,7 +76,7 @@ _CTX_UPDATE_KEY = "update_content_key"
 
 @require_superadmin
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    all_admins = users_db.get_all_admins()
+    all_admins = (await asyncio.to_thread(users_db.get_all_admins))
     now = datetime.now(timezone.utc)
 
     active_admins = 0
@@ -90,9 +89,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if sub_end > now:
                 active_admins += 1
 
-    total_channels = channels_db.get_all_channels_count()
-    total_income = tx_db.get_total_income()
-    total_tx = tx_db.get_total_transactions()
+    total_channels = (await asyncio.to_thread(channels_db.get_all_channels_count))
+    total_income = (await asyncio.to_thread(tx_db.get_total_income))
+    total_tx = (await asyncio.to_thread(tx_db.get_total_transactions))
 
     await update.message.reply_text(
         f"📊 *Bot Statistics*\n\n"
@@ -111,7 +110,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 @require_superadmin
 async def alladmins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    admins = users_db.get_all_admins()
+    admins = (await asyncio.to_thread(users_db.get_all_admins))
 
     if not admins:
         await update.message.reply_text("📭 No admins found.")
@@ -123,7 +122,7 @@ async def alladmins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     for i, admin in enumerate(admins, start=1):
         raw_username = f"@{admin['username']}" if admin.get("username") else "—"
         username = raw_username.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        
+
         sub_end_str = admin.get("subscription_end")
         if sub_end_str:
             sub_end = datetime.fromisoformat(sub_end_str)
@@ -151,8 +150,8 @@ async def alladmins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 @require_superadmin
 async def allchannels_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    sources = channels_db.get_all_source_channels()
-    targets = channels_db.get_all_target_channels()
+    sources = (await asyncio.to_thread(channels_db.get_all_source_channels))
+    targets = (await asyncio.to_thread(channels_db.get_all_target_channels))
 
     if not sources and not targets:
         await update.message.reply_text("📭 No channels configured yet.")
@@ -199,6 +198,7 @@ async def addadmin_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ADDADMIN_USERID_WAIT
 
 
+@require_superadmin
 async def addadmin_userid_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
 
@@ -207,7 +207,7 @@ async def addadmin_userid_receive(update: Update, context: ContextTypes.DEFAULT_
         return ADDADMIN_USERID_WAIT
 
     target_id = int(text)
-    user = users_db.get_or_create_user(target_id)
+    user = (await asyncio.to_thread(users_db.get_or_create_user, target_id))
 
     context.user_data[_CTX_TARGET_USER] = target_id
     username = f"@{user['username']}" if user.get("username") else f"ID {target_id}"
@@ -227,6 +227,7 @@ async def addadmin_userid_receive(update: Update, context: ContextTypes.DEFAULT_
     return ADDADMIN_DURATION_WAIT
 
 
+@require_superadmin
 async def addadmin_duration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -252,7 +253,7 @@ async def addadmin_duration_callback(update: Update, context: ContextTypes.DEFAU
         plan = "manual"
 
     # Promote using the unified subscription setter
-    set_subscription(
+    (await asyncio.to_thread(set_subscription,
         user_id=target_id,
         plan=plan,
         start_dt=now,
@@ -260,8 +261,8 @@ async def addadmin_duration_callback(update: Update, context: ContextTypes.DEFAU
         payment_method="manual",
         amount=0.0,
         payment_status="paid",
-    )
-    log_transaction(target_id, 0.0, duration_days, now, expires_at)
+    ))
+    (await asyncio.to_thread(log_transaction, target_id, 0.0, duration_days, now, expires_at))
 
     # Notify the promoted user
     try:
@@ -278,7 +279,7 @@ async def addadmin_duration_callback(update: Update, context: ContextTypes.DEFAU
     except Exception as exc:
         logger.warning("Could not notify user %s: %s", target_id, exc)
 
-    user = users_db.get_user(target_id)
+    user = (await asyncio.to_thread(users_db.get_user, target_id))
     username = f"@{user['username']}" if user and user.get("username") else f"ID {target_id}"
 
     await query.edit_message_text(
@@ -305,6 +306,7 @@ async def removeadmin_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return REMOVEADMIN_WAIT
 
 
+@require_superadmin
 async def removeadmin_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
 
@@ -313,7 +315,7 @@ async def removeadmin_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
         return REMOVEADMIN_WAIT
 
     target_id = int(text)
-    user = users_db.get_user(target_id)
+    user = (await asyncio.to_thread(users_db.get_user, target_id))
 
     if user is None:
         await update.message.reply_text(f"❌ User `{target_id}` not found.", parse_mode="Markdown")
@@ -323,7 +325,10 @@ async def removeadmin_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"ℹ️ User `{target_id}` is not an admin.", parse_mode="Markdown")
         return ConversationHandler.END
 
-    users_db.set_role(target_id, "user")
+    (await asyncio.to_thread(users_db.revoke_subscription, target_id))
+    from bot.utils import userbot_manager
+    userbot_manager.invalidate_cache(target_id)
+    await userbot_manager.stop_userbot(target_id)
 
     # Notify the demoted user
     try:
@@ -361,6 +366,7 @@ async def addincome_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ADDINCOME_ADMINID_WAIT
 
 
+@require_superadmin
 async def addincome_adminid_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
     if not text.isdigit():
@@ -368,7 +374,7 @@ async def addincome_adminid_receive(update: Update, context: ContextTypes.DEFAUL
         return ADDINCOME_ADMINID_WAIT
 
     admin_id = int(text)
-    user = users_db.get_user(admin_id)
+    user = (await asyncio.to_thread(users_db.get_user, admin_id))
     if user is None:
         await update.message.reply_text(f"❌ User `{admin_id}` not found.", parse_mode="Markdown")
         return ADDINCOME_ADMINID_WAIT
@@ -383,6 +389,7 @@ async def addincome_adminid_receive(update: Update, context: ContextTypes.DEFAUL
     return ADDINCOME_AMOUNT_WAIT
 
 
+@require_superadmin
 async def addincome_amount_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip().replace(",", ".")
     admin_id = context.user_data.pop(_CTX_INCOME_ADMIN, None)
@@ -399,12 +406,12 @@ async def addincome_amount_receive(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("❌ Invalid amount. Send a positive number like `50` or `29.99`.")
         return ADDINCOME_AMOUNT_WAIT
 
-    user = users_db.get_user(admin_id)
+    user = (await asyncio.to_thread(users_db.get_user, admin_id))
     sub_end_str = user.get("subscription_end") if user else None
     now = datetime.now(timezone.utc)
     expires_at = datetime.fromisoformat(sub_end_str) if sub_end_str else now
 
-    log_transaction(admin_id, amount, 0, now, expires_at)
+    (await asyncio.to_thread(log_transaction, admin_id, amount, 0, now, expires_at))
 
     username = f"@{user['username']}" if user and user.get("username") else f"ID {admin_id}"
     await update.message.reply_text(
@@ -439,13 +446,14 @@ async def update_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     )
     return UPDATE_TEXT_WAIT
 
+@require_superadmin
 async def update_key_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
 
     key = query.data.split(":", 1)[1]
     context.user_data[_CTX_UPDATE_KEY] = key
-    
+
     friendly_names = {
         "welcome_msg": "Welcome Message",
         "howtoauth": "Help - Link Account",
@@ -454,7 +462,7 @@ async def update_key_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         "howtoschedule": "Help - Schedule Messages",
         "howtopro": "Help - Premium Info"
     }
-    
+
     await query.edit_message_text(
         f"📝 <b>Updating: {friendly_names.get(key, key)}</b>\n\n"
         f"Please send me the new text for this section now.\n"
@@ -464,23 +472,24 @@ async def update_key_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     return UPDATE_TEXT_WAIT
 
+@require_superadmin
 async def update_text_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     new_text = update.message.text
     if not new_text:
         await update.message.reply_text("❌ Please send text only.")
         return UPDATE_TEXT_WAIT
-        
+
     key = context.user_data.pop(_CTX_UPDATE_KEY, None)
     if not key:
         await update.message.reply_text("❌ Session expired. Please run /update again.")
         return ConversationHandler.END
-        
-    success = set_content(key, new_text)
+
+    success = (await asyncio.to_thread(set_content, key, new_text))
     if success:
         await update.message.reply_text("✅ *Content updated successfully!*", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Failed to update content in database.", parse_mode="Markdown")
-        
+
     return ConversationHandler.END
 
 
@@ -503,9 +512,9 @@ async def admin_subscriptions_command(update: Update, context: ContextTypes.DEFA
     """Show active, expiring soon, and expired subscription report."""
     now = datetime.now(timezone.utc)
 
-    active = get_active_subscriptions()
-    expiring = get_expiring_soon_admins(days=3)
-    expired = get_expired_admins()
+    active = (await asyncio.to_thread(get_active_subscriptions))
+    expiring = (await asyncio.to_thread(get_expiring_soon_admins, days=3))
+    expired = (await asyncio.to_thread(get_expired_admins))
 
     expiring_ids = {u["user_id"] for u in expiring}
     true_active = [u for u in active if u["user_id"] not in expiring_ids]
@@ -582,7 +591,7 @@ async def grant_premium_command(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    user = users_db.get_user(target_id)
+    user = (await asyncio.to_thread(users_db.get_user, target_id))
     if user is None:
         await update.message.reply_text(
             f"❌ User `{target_id}` not found. They must send /start first.",
@@ -603,7 +612,7 @@ async def grant_premium_command(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         plan = "manual"
 
-    set_subscription(
+    (await asyncio.to_thread(set_subscription,
         user_id=target_id,
         plan=plan,
         start_dt=now,
@@ -611,8 +620,8 @@ async def grant_premium_command(update: Update, context: ContextTypes.DEFAULT_TY
         payment_method="manual",
         amount=0.0,
         payment_status="paid",
-    )
-    log_transaction(target_id, 0.0, days, now, expires_at)
+    ))
+    (await asyncio.to_thread(log_transaction, target_id, 0.0, days, now, expires_at))
 
     username = f"@{user['username']}" if user.get("username") else f"ID {target_id}"
 
@@ -667,7 +676,7 @@ async def revoke_premium_command(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Invalid USER_ID. Must be a numeric Telegram user ID.")
         return
 
-    user = users_db.get_user(target_id)
+    user = (await asyncio.to_thread(users_db.get_user, target_id))
     if user is None:
         await update.message.reply_text(f"❌ User `{target_id}` not found.", parse_mode="Markdown")
         return
@@ -679,7 +688,10 @@ async def revoke_premium_command(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    revoke_subscription(target_id)
+    (await asyncio.to_thread(revoke_subscription, target_id))
+    from bot.utils import userbot_manager
+    userbot_manager.invalidate_cache(target_id)
+    await userbot_manager.stop_userbot(target_id)
 
     username = f"@{user['username']}" if user.get("username") else f"ID {target_id}"
 
@@ -709,7 +721,7 @@ async def revoke_premium_command(update: Update, context: ContextTypes.DEFAULT_T
 
 @require_superadmin
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    total = users_db.get_all_users_count()
+    total = (await asyncio.to_thread(users_db.get_all_users_count))
     await update.message.reply_text(
         f"📢 *Broadcast Message*\n\n"
         f"Total recipients: *{total} users*\n\n"
@@ -721,9 +733,10 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return BROADCAST_WAIT
 
 
+@require_superadmin
 async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = update.message
-    all_users = users_db.get_all_users()
+    all_users = (await asyncio.to_thread(users_db.get_all_users))
     total = len(all_users)
 
     sent = 0
@@ -740,7 +753,7 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         uid = user["user_id"]
         # Add a tiny delay between messages to respect Telegram limits
         await asyncio.sleep(0.05)
-        
+
         try:
             if msg.photo:
                 await context.bot.send_photo(
@@ -861,8 +874,8 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 @require_superadmin
 async def referralstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show top referrers leaderboard."""
-    top = ref_db.get_top_referrers(limit=10)
-    payout = ref_db.get_referral_payout_amount()
+    top = (await asyncio.to_thread(ref_db.get_top_referrers, limit=10))
+    payout = (await asyncio.to_thread(ref_db.get_referral_payout_amount))
 
     if not top:
         await update.message.reply_text("📭 No referral conversions yet.")
@@ -893,6 +906,7 @@ async def editreferral_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return EDITREFERRAL_USERID_WAIT
 
 
+@require_superadmin
 async def editreferral_userid_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
     try:
@@ -901,7 +915,7 @@ async def editreferral_userid_receive(update: Update, context: ContextTypes.DEFA
         await update.message.reply_text("❌ Invalid User ID. Send a numeric Telegram user ID.")
         return EDITREFERRAL_USERID_WAIT
 
-    stats = ref_db.get_referral_stats(user_id)
+    stats = (await asyncio.to_thread(ref_db.get_referral_stats, user_id))
     context.user_data["ref_edit_uid"] = user_id
 
     await update.message.reply_text(
@@ -917,6 +931,7 @@ async def editreferral_userid_receive(update: Update, context: ContextTypes.DEFA
     return EDITREFERRAL_AMOUNT_WAIT
 
 
+@require_superadmin
 async def editreferral_amount_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
     try:
@@ -928,7 +943,7 @@ async def editreferral_amount_receive(update: Update, context: ContextTypes.DEFA
         return EDITREFERRAL_AMOUNT_WAIT
 
     user_id = context.user_data.get("ref_edit_uid")
-    success = ref_db.adjust_user_earnings(user_id, new_amount)
+    success = (await asyncio.to_thread(ref_db.adjust_user_earnings, user_id, new_amount))
 
     if success:
         await update.message.reply_text(
@@ -1003,7 +1018,7 @@ def register(application) -> None:
         fallbacks=[cancel_handler],
         name="addincome",
     ))
-    
+
     # /update conversation
     application.add_handler(ConversationHandler(
         entry_points=[CommandHandler("update", update_start)],

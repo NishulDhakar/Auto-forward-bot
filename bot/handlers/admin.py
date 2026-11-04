@@ -31,13 +31,6 @@ from telegram.ext import (
     filters,
 )
 
-from telethon import TelegramClient
-from telethon.errors import (
-    SessionPasswordNeededError,
-    PhoneCodeExpiredError,
-    PhoneCodeInvalidError,
-    FloodWaitError,
-)
 
 from bot.config import TELEGRAM_API_ID, TELEGRAM_API_HASH
 from bot.db import channels as channels_db
@@ -84,25 +77,25 @@ def parse_schedule_time(time_str: str) -> str | None:
     match = pattern.match(time_str)
     if not match:
         return None
-    
+
     hour = int(match.group(1))
     minute = int(match.group(2))
     ampm = (match.group(3) or "").upper()
     tz = (match.group(4) or "").upper()
-    
+
     if ampm == "PM" and hour < 12:
         hour += 12
     elif ampm == "AM" and hour == 12:
         hour = 0
-        
+
     if hour > 23 or minute > 59:
         return None
-        
+
     dt = datetime(2000, 1, 1, hour, minute)
-    
+
     if tz in ("IND", "IST"):
         dt = dt - timedelta(hours=5, minutes=30)
-        
+
     return dt.strftime("%H:%M")
 
 
@@ -135,6 +128,7 @@ async def _resolve_channel(bot, identifier: str) -> tuple[int | None, str | None
 
 async def _cleanup_auth(context: ContextTypes.DEFAULT_TYPE, admin_id: int) -> None:
     """Disconnect and clean up any pending auth client."""
+    await userbot_manager.clear_pending_auth(admin_id)
     client = context.user_data.pop("auth_client", None)
     if client:
         try:
@@ -175,6 +169,7 @@ async def _clear_other_conversations(update: Update, context: ContextTypes.DEFAU
 # /authorize — OTP login
 # ─────────────────────────────────────────────────────────────────────────────
 
+@require_admin
 async def authorize_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await _clear_other_conversations(update, context, "authorize")
     admin_id = update.effective_user.id
@@ -191,7 +186,7 @@ async def authorize_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return ConversationHandler.END
 
-    if userbot_manager.is_userbot_authorized(admin_id):
+    if (await asyncio.to_thread(userbot_manager.is_userbot_authorized, admin_id)):
         await update.effective_message.reply_text(
             "✅ *Already Authorized!*\n\n"
             "Your Telegram account is already linked and actively monitoring your source channel.\n\n"
@@ -213,6 +208,7 @@ async def authorize_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 
+@require_admin
 async def auth_phone_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     phone = update.message.text.strip()
     admin_id = update.message.from_user.id
@@ -228,8 +224,8 @@ async def auth_phone_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
     connecting_msg = await update.message.reply_text("⏳ Connecting to Telegram...")
 
     try:
-        userbot_manager.clear_pending_auth(admin_id)
-        userbot_manager.remove_session(admin_id)
+        await userbot_manager.clear_pending_auth(admin_id)
+        (await asyncio.to_thread(userbot_manager.remove_session, admin_id))
 
         # connect and pre-switch DC
         from telethon.errors import FloodWaitError
@@ -257,7 +253,7 @@ async def auth_phone_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"Too many login attempts. Please wait *{e.seconds} seconds* and try /authorize again.",
             parse_mode="Markdown",
         )
-        userbot_manager.clear_pending_auth(admin_id)
+        await userbot_manager.clear_pending_auth(admin_id)
         return ConversationHandler.END
 
     except Exception as exc:
@@ -267,14 +263,19 @@ async def auth_phone_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Please check your phone number and try /authorize again.",
             parse_mode="Markdown",
         )
-        userbot_manager.clear_pending_auth(admin_id)
+        await userbot_manager.clear_pending_auth(admin_id)
         return ConversationHandler.END
 
 
+@require_admin
 async def auth_code_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     raw = update.message.text.strip()
     code = re.sub(r"\D", "", raw)
     admin_id = update.message.from_user.id
+    try:
+        await update.message.delete()
+    except Exception:
+        logger.warning("Could not remove sensitive auth message for admin %s", admin_id)
 
     pending = userbot_manager.get_pending_auth(admin_id)
     if not pending:
@@ -297,13 +298,13 @@ async def auth_code_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             PhoneCodeInvalidError, PhoneCodeExpiredError, SessionPasswordNeededError
         )
 
-        logger.info("Attempting sign_in for admin %s with code hash %s", admin_id, code_hash[:8])
+        logger.info("Attempting sign_in for admin %s", admin_id)
         await client.sign_in(phone=phone, code=code, phone_code_hash=code_hash)
 
         # Success
         session_string = client.session.save()
-        userbot_manager.save_session_string(admin_id, session_string)
-        userbot_manager.clear_pending_auth(admin_id)
+        (await asyncio.to_thread(userbot_manager.save_session_string, admin_id, session_string))
+        await userbot_manager.clear_pending_auth(admin_id)
         await update.message.reply_text(
             "✅ *Authorization Successful!*\n\n"
             "Your Telegram account is now linked.\n\n"
@@ -323,8 +324,8 @@ async def auth_code_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return AUTH_CODE_WAIT
 
     except PhoneCodeExpiredError:
-        logger.warning("Code expired for admin %s — code_hash=%s", admin_id, code_hash[:8])
-        userbot_manager.clear_pending_auth(admin_id)
+        logger.warning("Code expired for admin %s", admin_id)
+        await userbot_manager.clear_pending_auth(admin_id)
         await update.message.reply_text(
             "⏰ *Code Expired*\n\n"
             "The verification code has expired (Telegram's server rejected it).\n"
@@ -346,7 +347,7 @@ async def auth_code_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     except Exception as e:
         logger.error("sign_in failed: %s | type: %s", e, type(e).__name__)
-        userbot_manager.clear_pending_auth(admin_id)
+        await userbot_manager.clear_pending_auth(admin_id)
         await update.message.reply_text(
             f"❌ *Login Failed*\n\n`{type(e).__name__}: {e}`\n\nRun /authorize again to try with a fresh code.",
             parse_mode="Markdown",
@@ -354,9 +355,14 @@ async def auth_code_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
 
 
+@require_admin
 async def auth_2fa_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    password = update.message.text.strip()
+    password = update.message.text
     admin_id = update.message.from_user.id
+    try:
+        await update.message.delete()
+    except Exception:
+        logger.warning("Could not remove sensitive auth message for admin %s", admin_id)
 
     pending = userbot_manager.get_pending_auth(admin_id)
     if not pending:
@@ -369,8 +375,8 @@ async def auth_2fa_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await client.sign_in(password=password)
 
         session_string = client.session.save()
-        userbot_manager.save_session_string(admin_id, session_string)
-        userbot_manager.clear_pending_auth(admin_id)
+        (await asyncio.to_thread(userbot_manager.save_session_string, admin_id, session_string))
+        await userbot_manager.clear_pending_auth(admin_id)
         await update.message.reply_text(
             "🎉 *Authorization Successful!* (2FA)\n\n"
             "Your Telegram account is now linked.\n\n"
@@ -393,7 +399,7 @@ async def auth_2fa_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def auth_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     admin_id = update.effective_user.id
-    userbot_manager.clear_pending_auth(admin_id)
+    await userbot_manager.clear_pending_auth(admin_id)
     await update.message.reply_text("❌ Authorization cancelled.")
     return ConversationHandler.END
 
@@ -404,7 +410,7 @@ async def auth_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 async def _check_authorized(update: Update, admin_id: int) -> bool:
     """Reply with prompt and return False if userbot not authorized."""
-    if not userbot_manager.is_userbot_authorized(admin_id):
+    if not (await asyncio.to_thread(userbot_manager.is_userbot_authorized, admin_id)):
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔐 Login Now", callback_data="auth_login")]
         ])
@@ -517,7 +523,7 @@ async def addsource_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
     else:
         await loading_msg.delete()
-        existing = channels_db.get_source_channel(admin_id)
+        existing = (await asyncio.to_thread(channels_db.get_source_channel, admin_id))
         existing_note = ""
         if existing:
             display = f"@{existing['channel_username']}" if existing.get("channel_username") else str(existing["channel_id"])
@@ -539,6 +545,7 @@ async def addsource_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ADD_SOURCE_WAIT
 
 
+@require_admin
 async def addsource_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = update.message
     admin_id = msg.from_user.id
@@ -580,7 +587,7 @@ async def addsource_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return ADD_SOURCE_WAIT
 
-    channels_db.set_source_channel(admin_id, channel_id, username)
+    (await asyncio.to_thread(channels_db.set_source_channel, admin_id, channel_id, username))
     await userbot_manager.restart_userbot_listener(admin_id, context.bot)
 
     display = f"@{username}" if username else str(channel_id)
@@ -595,6 +602,7 @@ async def addsource_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ConversationHandler.END
 
 
+@require_admin
 async def addsource_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -616,7 +624,7 @@ async def addsource_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     channel_id = selected["id"]
     username = selected["username"]
 
-    channels_db.set_source_channel(admin_id, channel_id, username)
+    (await asyncio.to_thread(channels_db.set_source_channel, admin_id, channel_id, username))
     await userbot_manager.restart_userbot_listener(admin_id, context.bot)
 
     display = f"@{username}" if username else str(channel_id)
@@ -656,7 +664,7 @@ async def addtarget_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
     else:
         await loading_msg.delete()
-        targets = channels_db.get_target_channels(admin_id)
+        targets = (await asyncio.to_thread(channels_db.get_target_channels, admin_id))
         count = len(targets)
         count_note = f"\n\nYou currently have *{count}* target channel(s)." if count else ""
 
@@ -676,6 +684,7 @@ async def addtarget_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ADD_TARGET_WAIT
 
 
+@require_admin
 async def addtarget_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = update.message
     admin_id = msg.from_user.id
@@ -699,7 +708,7 @@ async def addtarget_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return ADD_TARGET_WAIT
 
-    added = channels_db.add_target_channel(admin_id, channel_id, username)
+    added = (await asyncio.to_thread(channels_db.add_target_channel, admin_id, channel_id, username))
     invalidate_cache(admin_id)
     display = f"@{username}" if username else str(channel_id)
 
@@ -709,7 +718,7 @@ async def addtarget_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             parse_mode="Markdown",
         )
     else:
-        targets = channels_db.get_target_channels(admin_id)
+        targets = (await asyncio.to_thread(channels_db.get_target_channels, admin_id))
         await msg.reply_text(
             f"✅ *Target channel added!*\n\n"
             f"🎯 `{display}` (ID: `{channel_id}`)\n\n"
@@ -723,6 +732,7 @@ async def addtarget_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ConversationHandler.END
 
 
+@require_admin
 async def addtarget_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -744,7 +754,7 @@ async def addtarget_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     channel_id = selected["id"]
     username = selected["username"]
 
-    added = channels_db.add_target_channel(admin_id, channel_id, username)
+    added = (await asyncio.to_thread(channels_db.add_target_channel, admin_id, channel_id, username))
     invalidate_cache(admin_id)
     display = f"@{username}" if username else str(channel_id)
 
@@ -754,7 +764,7 @@ async def addtarget_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="Markdown",
         )
     else:
-        targets = channels_db.get_target_channels(admin_id)
+        targets = (await asyncio.to_thread(channels_db.get_target_channels, admin_id))
         await query.edit_message_text(
             f"✅ *Target channel added!*\n\n"
             f"🎯 `{display}` (ID: `{channel_id}`)\n\n"
@@ -778,13 +788,13 @@ async def removesource_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not await _check_authorized(update, admin_id):
         return
 
-    source = channels_db.get_source_channel(admin_id)
+    source = (await asyncio.to_thread(channels_db.get_source_channel, admin_id))
     if not source:
         await update.message.reply_text("📭 You don't have a source channel set.")
         return
 
     display = f"@{source['channel_username']}" if source.get("channel_username") else str(source["channel_id"])
-    channels_db.remove_source_channel(admin_id)
+    (await asyncio.to_thread(channels_db.remove_source_channel, admin_id))
     await userbot_manager.stop_userbot(admin_id)
     await update.message.reply_text(
         f"✅ Source channel `{display}` removed.\n"
@@ -803,7 +813,7 @@ async def removetarget_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not await _check_authorized(update, admin_id):
         return
 
-    targets = channels_db.get_target_channels(admin_id)
+    targets = (await asyncio.to_thread(channels_db.get_target_channels, admin_id))
     if not targets:
         await update.message.reply_text("📭 You have no target channels set. Use /addtarget to add one.")
         return
@@ -822,16 +832,17 @@ async def removetarget_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+@require_admin
 async def removetarget_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     admin_id = query.from_user.id
     channel_id = int(query.data.split(":", 1)[1])
 
-    deleted = channels_db.remove_target_channel(admin_id, channel_id)
+    deleted = (await asyncio.to_thread(channels_db.remove_target_channel, admin_id, channel_id))
     invalidate_cache(admin_id)
     if deleted:
-        targets = channels_db.get_target_channels(admin_id)
+        targets = (await asyncio.to_thread(channels_db.get_target_channels, admin_id))
         await query.edit_message_text(
             f"✅ Target channel removed.\n"
             f"Remaining targets: *{len(targets)}*",
@@ -859,7 +870,7 @@ async def filter_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         [InlineKeyboardButton("🚫 Block Message by Keyword", callback_data="ftype:block")],
         [InlineKeyboardButton("📦 Block APK Files", callback_data="ftype:block_apk")]
     ]
-    
+
     await update.message.reply_text(
         "🔧 *Add Text Filter*\n\n"
         "Filters automatically replace text, links, or usernames in messages before forwarding.\n\n"
@@ -869,11 +880,12 @@ async def filter_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     )
     return FILTER_TYPE_WAIT
 
+@require_admin
 async def filter_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     ftype = query.data.split(":")[1]
-    
+
     if ftype == "all_links":
         context.user_data[_CTX_FIND] = "<ALL_LINKS>"
         await query.edit_message_text(
@@ -885,7 +897,7 @@ async def filter_type_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="Markdown",
         )
         return FILTER_REPLACE_WAIT
-        
+
     elif ftype == "all_usernames":
         context.user_data[_CTX_FIND] = "<ALL_USERNAMES>"
         await query.edit_message_text(
@@ -897,7 +909,7 @@ async def filter_type_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="Markdown",
         )
         return FILTER_REPLACE_WAIT
-        
+
     elif ftype == "block":
         context.user_data[_CTX_FIND] = "<BLOCK>"
         await query.edit_message_text(
@@ -909,9 +921,9 @@ async def filter_type_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="Markdown",
         )
         return FILTER_REPLACE_WAIT
-        
+
     elif ftype == "block_apk":
-        filters_db.add_filter(update.effective_user.id, "<BLOCK_APK>", "true")
+        (await asyncio.to_thread(filters_db.add_filter, update.effective_user.id, "<BLOCK_APK>", "true"))
         invalidate_cache(update.effective_user.id)
         await query.edit_message_text(
             "✅ *Filter saved!*\n\n"
@@ -932,6 +944,7 @@ async def filter_type_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return FILTER_FIND_WAIT
 
 
+@require_admin
 async def filter_find_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     find_text = update.message.text.strip()
     if not find_text:
@@ -948,6 +961,7 @@ async def filter_find_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
     return FILTER_REPLACE_WAIT
 
 
+@require_admin
 async def filter_replace_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     replace_text = update.message.text or ""
     find_text = context.user_data.pop(_CTX_FIND, None)
@@ -957,13 +971,13 @@ async def filter_replace_receive(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Session expired. Please start /filter again.")
         return ConversationHandler.END
 
-    filters_db.add_filter(admin_id, find_text, replace_text.strip())
+    (await asyncio.to_thread(filters_db.add_filter, admin_id, find_text, replace_text.strip()))
     invalidate_cache(admin_id)
 
     label = f"`{replace_text.strip()}`" if replace_text.strip() else "_(deleted)_"
     display_find = "Any Link" if find_text == "<ALL_LINKS>" else "Any Username" if find_text == "<ALL_USERNAMES>" else "Block Keyword" if find_text == "<BLOCK>" else f"`{find_text}`"
-    
-    current = filters_db.get_filters(admin_id)
+
+    current = (await asyncio.to_thread(filters_db.get_filters, admin_id))
     await update.message.reply_text(
         f"✅ *Filter saved!*\n\n"
         f"Find: {display_find}\n"
@@ -984,7 +998,7 @@ async def myfilters_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not await _check_authorized(update, admin_id):
         return
 
-    rule_list = filters_db.get_filters(admin_id)
+    rule_list = (await asyncio.to_thread(filters_db.get_filters, admin_id))
     if not rule_list:
         await update.message.reply_text(
             "📭 No filters set yet.\n\nUse /filter to add a text replacement rule."
@@ -1006,12 +1020,13 @@ async def myfilters_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 
+@require_admin
 async def myfilters_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     filter_id = query.data.split(":", 1)[1]
     admin_id = query.from_user.id
-    deleted = filters_db.remove_filter(filter_id)
+    deleted = (await asyncio.to_thread(filters_db.remove_filter, filter_id, admin_id))
     invalidate_cache(admin_id)
     if deleted:
         await query.edit_message_text("✅ Filter removed.")
@@ -1026,7 +1041,7 @@ async def myfilters_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 @require_admin
 async def mystatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    user = users_db.get_user(user_id)
+    user = (await asyncio.to_thread(users_db.get_user, user_id))
 
     if not user:
         await update.message.reply_text("❌ User not found. Try /start first.")
@@ -1045,17 +1060,17 @@ async def mystatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     days_left = max(0, (sub_end - now).days)
     is_active = sub_end > now
 
-    source = channels_db.get_source_channel(user_id)
-    targets = channels_db.get_target_channels(user_id)
-    rule_list = filters_db.get_filters(user_id)
-    ub_active = userbot_manager.is_userbot_authorized(user_id)
+    source = (await asyncio.to_thread(channels_db.get_source_channel, user_id))
+    targets = (await asyncio.to_thread(channels_db.get_target_channels, user_id))
+    rule_list = (await asyncio.to_thread(filters_db.get_filters, user_id))
+    ub_active = (await asyncio.to_thread(userbot_manager.is_userbot_authorized, user_id))
 
     source_str = (
         f"@{source['channel_username']}" if source and source.get("channel_username")
         else str(source["channel_id"]) if source
         else "❌ Not set"
     )
-    ub_str = "✅ Linked & Active" if ub_active else "❌ Not linked — run /authorize"
+    ub_str = "✅ Session saved" if ub_active else "❌ Not linked — run /authorize"
 
     await update.message.reply_text(
         f"📊 *Your Status*\n\n"
@@ -1066,7 +1081,10 @@ async def mystatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"🔐 Account: {ub_str}\n"
         f"📡 Source: `{source_str}`\n"
         f"🎯 Targets: *{len(targets)}* channel(s)\n"
-        f"🔧 Filters: *{len(rule_list)}* rule(s)",
+        f"🔧 Filters: *{len(rule_list)}* rule(s)\n"
+        f"📡 Listener: {'Connected' if userbot_manager.is_userbot_running(user_id) else 'Offline'}\n"
+        f"📥 Queued posts: {userbot_manager.delivery_status(user_id)['queued']}\n"
+        f"⚠️ Recent delivery failures: {userbot_manager.delivery_status(user_id)['recent_failures']}",
         parse_mode="Markdown",
     )
 
@@ -1090,6 +1108,7 @@ async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return SCHED_CONTENT_WAIT
 
 
+@require_admin
 async def sched_content_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     content = update.message.text
     if not content:
@@ -1110,6 +1129,7 @@ async def sched_content_receive(update: Update, context: ContextTypes.DEFAULT_TY
     return SCHED_TIME_WAIT
 
 
+@require_admin
 async def sched_time_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     time_str = (update.message.text or "").strip()
     parsed_utc = parse_schedule_time(time_str)
@@ -1135,6 +1155,7 @@ async def sched_time_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return SCHED_FREQ_WAIT
 
 
+@require_admin
 async def sched_freq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -1148,7 +1169,7 @@ async def sched_freq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("❌ Session expired. Please start /schedule again.")
         return ConversationHandler.END
 
-    record = schedules_db.add_schedule(admin_id, content, post_time, frequency)
+    record = (await asyncio.to_thread(schedules_db.add_schedule, admin_id, content, post_time, frequency))
     schedule_id = record.get("id")
     if schedule_id:
         schedule_message(
@@ -1181,7 +1202,7 @@ async def removeschedule_command(update: Update, context: ContextTypes.DEFAULT_T
     if not await _check_authorized(update, admin_id):
         return
 
-    scheds = schedules_db.get_schedules(admin_id, active_only=True)
+    scheds = (await asyncio.to_thread(schedules_db.get_schedules, admin_id, active_only=True))
     if not scheds:
         await update.message.reply_text("📭 You have no active scheduled messages.")
         return
@@ -1200,11 +1221,12 @@ async def removeschedule_command(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
+@require_admin
 async def removeschedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     schedule_id = query.data.split(":", 1)[1]
-    deactivated = schedules_db.deactivate_schedule(schedule_id)
+    deactivated = (await asyncio.to_thread(schedules_db.deactivate_schedule, schedule_id, update.effective_user.id))
     if deactivated:
         remove_scheduled_job(schedule_id)
         await query.edit_message_text("✅ Scheduled message removed.")
@@ -1222,8 +1244,9 @@ async def work_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     from bot.db.supabase_client import get_client
     db = get_client()
     try:
-        db.table("users").update({"is_working": True}).eq("user_id", admin_id).execute()
+        (await asyncio.to_thread(lambda: db.table("users").update({"is_working": True}).eq("user_id", admin_id).execute()))
         invalidate_cache(admin_id)
+        await userbot_manager.start_userbot(admin_id, context.bot)
         await update.message.reply_text("▶️ *Bot Started Working*\n\nForwarding and scheduled messages are now active.", parse_mode="Markdown")
     except Exception as e:
         logger.error("Failed to update working status to True: %s", e)
@@ -1240,7 +1263,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     from bot.db.supabase_client import get_client
     db = get_client()
     try:
-        db.table("users").update({"is_working": False}).eq("user_id", admin_id).execute()
+        (await asyncio.to_thread(lambda: db.table("users").update({"is_working": False}).eq("user_id", admin_id).execute()))
         invalidate_cache(admin_id)
         await update.message.reply_text("⏸️ *Bot Stopped Working*\n\nForwarding and scheduled messages are now paused.", parse_mode="Markdown")
     except Exception as e:

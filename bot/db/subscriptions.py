@@ -196,3 +196,15 @@ def create_webhook_subscription(
     return res.data[0] if res.data else {}
 
 
+
+
+def activate_razorpay_payment(payment_id: str, telegram_id: int, plan_key: str,
+                              amount_paise: int, order_id: str = "") -> dict:
+    """Commit billing and deduplication together. Requires migration_reliability.sql."""
+    response = get_client().rpc("activate_razorpay_payment", {
+        "p_payment_id": payment_id, "p_telegram_id": telegram_id,
+        "p_plan_key": plan_key, "p_amount_paise": amount_paise, "p_order_id": order_id,
+    }).execute()
+    if not response.data:
+        raise RuntimeError("Payment activation returned no result")
+    return response.data[0]

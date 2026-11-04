@@ -131,17 +131,6 @@ def save_referred_by(user_id: int, referrer_id: int) -> None:
         pass
 
 
-def get_user(user_id: int) -> dict | None:
-    """Fetch a single user record by user_id."""
-    db = get_client()
-    res = db.table("users").select("*").eq("user_id", user_id).execute()
-    return res.data[0] if res.data else None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Subscription management (payment system)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def set_subscription(
     user_id: int,
     plan: str,

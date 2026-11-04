@@ -1,29 +1,4 @@
-"""
-bot/utils/userbot_manager.py
-Manages dynamic Telethon userbot sessions running in the background.
-
-Performance architecture (v3 — real-time):
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │  ROOT CAUSES FIXED:                                                  │
-  │  1. Supabase sync client BLOCKS the asyncio event loop — every DB   │
-  │     call (get_targets, get_filters) freezes Telethon for 50-200ms,  │
-  │     preventing it from receiving subsequent messages in real time.   │
-  │  2. Entity resolution on every send_message() adds latency.         │
-  │  3. No connection health monitoring — silent disconnects go          │
-  │     undetected, causing batch delivery when reconnected.            │
-  │  4. events.NewMessage without chats= filter processes ALL updates.  │
-  └──────────────────────────────────────────────────────────────────────┘
-
-  Solution:
-  • In-memory cache with background refresh (DB is NEVER called in the
-    hot path — zero event-loop blocking).
-  • Entity pre-resolution at startup.
-  • chats= filter on event handler for efficient event dispatch.
-  • asyncio.create_task() so each message processes independently.
-  • Telethon fast path with 10s timeout + Bot API fallback.
-  • Connection health monitor (periodic ping every 2 minutes).
-  • Sync Supabase calls wrapped in run_in_executor when cache misses.
-"""
+"""Telethon sessions, cached account configuration, and ordered forwarding."""
 
 from __future__ import annotations
 
@@ -33,7 +8,9 @@ import re
 import time
 import asyncio
 from datetime import datetime, timezone
-from functools import partial
+from copy import deepcopy
+
+from bot.utils.delivery import OrderedDispatcher, send_with_retry
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -48,9 +25,10 @@ logger = logging.getLogger(__name__)
 # Session storage
 # ─────────────────────────────────────────────────────────────────────────────
 _clients: dict[int, TelegramClient] = {}
+_listeners: dict[int, list] = {}
 _tasks:   dict[int, list] = {}          # admin_id -> list of background asyncio tasks
 _session_dir = os.path.expanduser("~/.tg_bot_sessions")
-os.makedirs(_session_dir, exist_ok=True)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,12 +39,7 @@ os.makedirs(_session_dir, exist_ok=True)
 _target_cache: dict[int, dict] = {}   # admin_id -> {"data": list, "ts": float}
 _filter_cache: dict[int, dict] = {}   # admin_id -> {"data": list, "ts": float}
 _working_cache: dict[int, dict] = {}  # admin_id -> {"data": bool, "ts": float}
-_CACHE_TTL = 300  # 5 minutes
-
-from collections import OrderedDict
-_processed_messages: dict[int, OrderedDict] = {} # admin_id -> OrderedDict(msg_id -> bool)
-_PROCESSED_MAX_SIZE = 100
-
+_CACHE_TTL = 30  # seconds
 
 async def _get_cached_targets(admin_id: int) -> list[dict]:
     """Return target channels from cache, refreshing in a thread if stale."""
@@ -95,15 +68,22 @@ async def _get_cached_filters(admin_id: int) -> list[dict]:
 async def _get_cached_working_status(admin_id: int) -> bool:
     """Return working status of the admin from cache, refreshing if stale."""
     cached = _working_cache.get(admin_id)
-    if cached and (time.time() - cached["ts"]) < _CACHE_TTL:
+    if cached and (time.time() - cached["ts"]) < _CACHE_TTL and time.time() < cached.get("expires", float("inf")):
         return cached["data"]
-    
+
     loop = asyncio.get_running_loop()
     user = await loop.run_in_executor(None, users_db.get_user, admin_id)
-    is_working = user.get("is_working", True) if user else True
-    if is_working is None:
-        is_working = True
-    _working_cache[admin_id] = {"data": bool(is_working), "ts": time.time()}
+    from bot.config import SUPER_ADMIN_ID
+    from bot.utils.roles import is_admin_active
+    active = admin_id == SUPER_ADMIN_ID or (user is not None and is_admin_active(user))
+    is_working = active and (user.get("is_working") is not False if user else True)
+    expires = float("inf")
+    if user and user.get("subscription_end") and admin_id != SUPER_ADMIN_ID:
+        expiry = datetime.fromisoformat(user["subscription_end"])
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        expires = expiry.timestamp()
+    _working_cache[admin_id] = {"data": bool(is_working), "ts": time.time(), "expires": expires}
     return _working_cache[admin_id]["data"]
 
 
@@ -130,7 +110,6 @@ def _adjust_entities_for_replacement(
     Replaces pattern_or_find with replace_str in text and adjusts entity offsets and lengths.
     Handles multiple matches of pattern_or_find.
     """
-    from telethon import types
     matches = []
     if is_regex:
         if isinstance(pattern_or_find, str):
@@ -153,27 +132,11 @@ def _adjust_entities_for_replacement(
     if not matches:
         return text, entities
 
-    current_entities = []
-    for e in entities:
-        if isinstance(e, types.MessageEntityBold):
-            current_entities.append(types.MessageEntityBold(e.offset, e.length))
-        elif isinstance(e, types.MessageEntityItalic):
-            current_entities.append(types.MessageEntityItalic(e.offset, e.length))
-        elif isinstance(e, types.MessageEntityCode):
-            current_entities.append(types.MessageEntityCode(e.offset, e.length))
-        elif isinstance(e, types.MessageEntityCustomEmoji):
-            current_entities.append(types.MessageEntityCustomEmoji(e.offset, e.length, e.document_id))
-        elif isinstance(e, types.MessageEntityTextUrl):
-            current_entities.append(types.MessageEntityTextUrl(e.offset, e.length, e.url))
-        elif isinstance(e, types.MessageEntityMention):
-            current_entities.append(types.MessageEntityMention(e.offset, e.length))
-        elif isinstance(e, types.MessageEntityUrl):
-            current_entities.append(types.MessageEntityUrl(e.offset, e.length))
-        else:
-            try:
-                current_entities.append(e.__class__(e.offset, e.length))
-            except Exception:
-                current_entities.append(e)
+    current_entities = deepcopy(entities)
+    # Telegram entities count UTF-16 code units, Python regex uses code points.
+    def utf16_len(value):
+        return len(value.encode("utf-16-le")) // 2
+    matches_utf16 = [(utf16_len(text[:start]), utf16_len(text[:end])) for start, end in matches]
 
     matches.sort(key=lambda x: x[0])
 
@@ -185,8 +148,8 @@ def _adjust_entities_for_replacement(
         new_e_start = e_start
         new_e_end = e_end
 
-        for start, end in matches:
-            diff = len(replace_str) - (end - start)
+        for start, end in matches_utf16:
+            diff = utf16_len(replace_str) - (end - start)
 
             if end <= e_start:
                 new_e_start += diff
@@ -196,7 +159,7 @@ def _adjust_entities_for_replacement(
             if end <= e_end:
                 new_e_end += diff
             elif start <= e_end < end:
-                new_e_end += (start + len(replace_str) - e_end)
+                new_e_end += (start + utf16_len(replace_str) - e_end)
 
         new_len = new_e_end - new_e_start
         if new_len > 0:
@@ -225,8 +188,7 @@ def _apply_cached_filters_with_entities(
     if text is None:
         return None, []
 
-    if entities is None:
-        entities = []
+    entities = deepcopy(entities or [])
 
     # Block rules first
     for rule in rules:
@@ -239,6 +201,13 @@ def _apply_cached_filters_with_entities(
         find = rule["find_text"]
         replace = rule["replace_text"]
         if find == "<ALL_LINKS>":
+            from telethon.types import MessageEntityTextUrl
+            for entity in list(entities):
+                if isinstance(entity, MessageEntityTextUrl):
+                    if replace:
+                        entity.url = replace
+                    else:
+                        entities.remove(entity)
             text, entities = _adjust_entities_for_replacement(
                 text, entities, r'https?://\S+|www\.\S+|t\.me/\S+', replace, is_regex=True
             )
@@ -273,11 +242,11 @@ def get_pending_auth(admin_id: int) -> dict | None:
     return _pending_auth.get(admin_id)
 
 
-def clear_pending_auth(admin_id: int) -> None:
+async def clear_pending_auth(admin_id: int) -> None:
     pending = _pending_auth.pop(admin_id, None)
     if pending and pending.get("client"):
         try:
-            pending["client"].disconnect()
+            await pending["client"].disconnect()
         except:
             pass
 
@@ -308,8 +277,12 @@ async def prepare_auth_client(phone: str) -> TelegramClient:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_session_string(admin_id: int, session_string: str) -> None:
+    os.makedirs(_session_dir, mode=0o700, exist_ok=True)
+    os.chmod(_session_dir, 0o700)
     path = os.path.join(_session_dir, f"admin_{admin_id}.session_str")
-    with open(path, "w") as f:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(session_string)
     logger.info("Session string saved to local file for admin %s", admin_id)
 
@@ -319,7 +292,7 @@ def save_session_string(admin_id: int, session_string: str) -> None:
         db.table("users").update({"session_string": session_string}).eq("user_id", admin_id).execute()
         logger.info("Session string also saved to DB for admin %s", admin_id)
     except Exception as e:
-        logger.debug("DB session_string save skipped: %s", e)
+        logger.error("Session database backup failed for admin %s: %s", admin_id, type(e).__name__)
 
 
 def load_session_string(admin_id: int) -> str | None:
@@ -385,6 +358,10 @@ async def _resolve_target(client: TelegramClient, admin_id: int, channel_id: int
         return False
 
 
+class TargetResolutionError(RuntimeError):
+    """Target could not be resolved before any send was attempted."""
+
+
 async def _get_target_entity(client: TelegramClient, admin_id: int, target_id: int) -> Any:
     """Retrieve target entity from cache, or resolve it dynamically on demand."""
     _resolved_entities.setdefault(admin_id, {})
@@ -397,7 +374,7 @@ async def _get_target_entity(client: TelegramClient, admin_id: int, target_id: i
         return entity
     except Exception as e:
         logger.warning("Failed to dynamically resolve target entity %s for admin %s: %s", target_id, admin_id, e)
-        return target_id
+        raise TargetResolutionError(f"Cannot resolve target {target_id}") from e
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -408,10 +385,13 @@ async def start_userbot(admin_id: int, bot) -> TelegramClient | None:
     if admin_id in _clients:
         return _clients[admin_id]
 
-    session_string = load_session_string(admin_id)
+    if not await is_admin_working(admin_id):
+        return None
+    session_string = await asyncio.to_thread(load_session_string, admin_id)
     if not session_string:
         return None
 
+    client = None
     try:
         logger.info("Starting background userbot for admin %s...", admin_id)
         client = TelegramClient(
@@ -431,14 +411,14 @@ async def start_userbot(admin_id: int, bot) -> TelegramClient | None:
         if not await client.is_user_authorized():
             logger.warning("Session unauthorized for admin %s. Removing.", admin_id)
             await client.disconnect()
-            remove_session(admin_id)
+            await asyncio.to_thread(remove_session, admin_id)
             return None
 
-        source = channels_db.get_source_channel(admin_id)
+        source = await asyncio.to_thread(channels_db.get_source_channel, admin_id)
         if source:
             source_id = source["channel_id"]
             source_username = source.get("channel_username")
-            
+
             # If it's a public channel and we have the username, ensure we are joined
             # because Telegram does not push NewMessage events to non-members of public channels!
             if source_username:
@@ -453,16 +433,11 @@ async def start_userbot(admin_id: int, bot) -> TelegramClient | None:
             try:
                 await client.get_input_entity(source_id)
             except Exception:
-                logger.error("Admin %s userbot cannot access source channel %s", admin_id, source_id)
-                try:
-                    await bot.send_message(
-                        chat_id=admin_id,
-                        text="⚠️ *Userbot Access Error*\n\nYour userbot account is **not a member** of your configured source channel. It cannot forward messages until you add it to the channel.",
-                        parse_mode="Markdown"
-                    )
-                except Exception:
-                    pass
-
+                # StringSession stores credentials but no persistent entity cache.
+                # Load dialog access hashes for private channels after a restart.
+                await client.get_dialogs()
+                await client.get_input_entity(source_id)
+                logger.info("Loaded private source access hash for admin %s", admin_id)
             # Pre-warm caches so the first message doesn't hit DB
             loop = asyncio.get_running_loop()
             targets = await loop.run_in_executor(None, channels_db.get_target_channels, admin_id)
@@ -481,6 +456,9 @@ async def start_userbot(admin_id: int, bot) -> TelegramClient | None:
                 else:
                     logger.warning("  ✗ Cannot pre-resolve target %s for admin %s (will use Bot API fallback)", tid, admin_id)
 
+            # Establish a baseline once; the poller recovers subsequent gaps.
+            latest = await client.get_messages(source_id, limit=1)
+            _poll_cursors[admin_id] = latest[0].id if latest else 0
             # Register event handler with chats= filter for efficient dispatch
             _register_forwarding_listener(client, admin_id, source_id, bot)
             logger.info("Userbot listening on source %s for admin %s", source_id, admin_id)
@@ -494,6 +472,8 @@ async def start_userbot(admin_id: int, bot) -> TelegramClient | None:
         return client
 
     except Exception as exc:
+        if client is not None:
+            await client.disconnect()
         error_str = str(exc)
         # Detect permanently invalidated session (used from 2 IPs simultaneously)
         if "authorization key" in error_str.lower() or "AuthKeyDuplicated" in error_str:
@@ -502,7 +482,7 @@ async def start_userbot(admin_id: int, bot) -> TelegramClient | None:
                 "Auto-removing and alerting admin to re-authorize.", admin_id
             )
             # Wipe the dead session so the bot doesn't keep retrying it
-            remove_session(admin_id)
+            await asyncio.to_thread(remove_session, admin_id)
             # Alert the admin via Telegram so they know to re-link
             try:
                 await bot.send_message(
@@ -547,518 +527,211 @@ async def _connection_monitor(client: TelegramClient, admin_id: int, bot) -> Non
             logger.error("Connection monitor error for admin %s: %s", admin_id, e)
 
 
+_dispatcher = OrderedDispatcher()
+_poll_cursors: dict[int, int] = {}
+_target_slots = asyncio.Semaphore(8)
+
+
 async def _channel_poller(client: TelegramClient, bot, admin_id: int, source_channel_id: int) -> None:
-    """
-    Background fallback poller. Telegram often drops push events for large public channels.
-    This manually fetches the latest messages every 15s to catch anything the listener missed.
-    """
+    """Recover gaps since startup in chronological pages, retaining album boundaries."""
     from telethon.errors import FloodWaitError
-    await asyncio.sleep(5)  # Let event loop stabilize on startup
     while admin_id in _clients and _clients[admin_id] is client:
+        await asyncio.sleep(15)
         try:
-            # Fetch latest 5 messages
-            async for message in client.iter_messages(source_channel_id, limit=5):
-                # Check if already processed
-                if admin_id in _processed_messages and message.id in _processed_messages[admin_id]:
-                    continue
-                    
-                # Construct a dummy event object for _process_and_forward
-                class DummyEvent:
-                    pass
-                event = DummyEvent()
-                event.message = message
-                event.chat_id = source_channel_id
-                
-                logger.info("Poller caught missed message %s for admin %s", message.id, admin_id)
-                asyncio.create_task(_process_and_forward(client, bot, event, admin_id))
-                
-            await asyncio.sleep(15)
-        except FloodWaitError as e:
-            logger.warning("Poller flood wait for admin %s. Sleeping %s seconds", admin_id, e.seconds)
-            await asyncio.sleep(e.seconds)
+            cursor = _poll_cursors.get(admin_id, 0)
+            # Snapshot the upper bound so a busy source cannot monopolize the loop.
+            latest = await client.get_messages(source_channel_id, limit=1)
+            upper = latest[0].id if latest else cursor
+            album = []
+            async for msg in client.iter_messages(source_channel_id, min_id=cursor,
+                                                  max_id=upper + 1, reverse=True):
+                if album and msg.grouped_id != album[0].grouped_id:
+                    await _enqueue_messages(client, bot, admin_id, source_channel_id, album)
+                    _poll_cursors[admin_id] = album[-1].id
+                    album = []
+                if msg.grouped_id:
+                    album.append(msg)
+                else:
+                    await _enqueue_messages(client, bot, admin_id, source_channel_id, [msg])
+                    _poll_cursors[admin_id] = msg.id
+            if album:
+                # A fresh album may still be arriving; finish it on the next pass.
+                age = (datetime.now(timezone.utc) - album[-1].date).total_seconds()
+                if age >= 3:
+                    await _enqueue_messages(client, bot, admin_id, source_channel_id, album)
+                    _poll_cursors[admin_id] = album[-1].id
+        except FloodWaitError as exc:
+            await asyncio.sleep(exc.seconds)
         except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.debug("Poller error for admin %s: %s", admin_id, e)
-            await asyncio.sleep(15)
+            raise
+        except Exception:
+            logger.exception("Recovery poll failed for admin %s", admin_id)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Forwarding engine (v3) — real-time, non-blocking, zero event-loop blocking
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _normalize_id(cid) -> int:
-    """Strip the -100 prefix so Telethon and DB channel IDs can be compared."""
-    s = str(cid)
-    if s.startswith("-100"): return int(s[4:])
-    if s.startswith("-"):    return int(s[1:])
-    return int(s)
-
-
-def _register_forwarding_listener(
-    client: TelegramClient,
-    admin_id: int,
-    source_channel_id: int,
-    bot,
-) -> None:
-    """
-    Register a Telethon event handler. We use a manual ID check because
-    Telethon's chats= filter can fail silently if the -100 prefix mismatches.
-    Each message is dispatched to a background task immediately.
-    """
-
-    @client.on(events.NewMessage())
+def _register_forwarding_listener(client, admin_id: int, source_channel_id: int, bot) -> None:
+    # Integer peer IDs let Telethon filter updates before running our handlers.
+    @client.on(events.NewMessage(chats=source_channel_id))
     async def handler(event):
-        # Skip grouped messages (albums) in NewMessage handler to let the Album handler process them
-        if event.message.grouped_id is not None:
-            return
+        if not event.message.grouped_id:
+            await _enqueue_messages(client, bot, admin_id, source_channel_id, [event.message])
 
-        incoming_id = _normalize_id(event.chat_id)
-        expected_id = _normalize_id(source_channel_id)
-        
-        # Log every single incoming message to debug the filter
-        logger.debug(f"Received msg from {event.chat_id} (normalized: {incoming_id}). Expected source: {source_channel_id} (normalized: {expected_id})")
-        
-        if incoming_id != expected_id:
-            return
-        # Fire-and-forget: handler returns instantly, forwarding runs in background
-        asyncio.create_task(_process_and_forward(client, bot, event, admin_id))
-
-    @client.on(events.Album())
+    @client.on(events.Album(chats=source_channel_id))
     async def album_handler(event):
-        incoming_id = _normalize_id(event.chat_id)
-        expected_id = _normalize_id(source_channel_id)
-        
-        if incoming_id != expected_id:
-            return
-        asyncio.create_task(_process_and_forward_album(client, bot, event, admin_id))
+        await _enqueue_messages(client, bot, admin_id, source_channel_id, event.messages)
+
+    _listeners[admin_id] = [handler, album_handler]
 
 
-async def _process_and_forward(
-    client: TelegramClient, bot, event, admin_id: int,
-) -> None:
-    """Core forwarding pipeline for a single incoming message."""
-    try:
-        # ── Deduplication check (prevents double-forward from listener + poller) ──
-        msg_id = getattr(event.message, "id", None)
-        if msg_id is not None:
-            if admin_id not in _processed_messages:
-                _processed_messages[admin_id] = OrderedDict()
-            if msg_id in _processed_messages[admin_id]:
-                return
-            _processed_messages[admin_id][msg_id] = True
-            if len(_processed_messages[admin_id]) > _PROCESSED_MAX_SIZE:
-                _processed_messages[admin_id].popitem(last=False)
-
-        # ── Skip stale messages (prevents backlog flood on restart) ──────
-        if event.message.date:
-            now = datetime.now(timezone.utc)
-            msg_date = event.message.date
-            if msg_date.tzinfo is None:
-                msg_date = msg_date.replace(tzinfo=timezone.utc)
-            age = (now - msg_date).total_seconds()
-            if age > 30:
-                logger.warning("Skipping stale message (%.0fs old) for admin %s", age, admin_id)
-                return
-
-        # ── Get targets and filters from cache (NEVER blocks event loop) ─
-        targets = await _get_cached_targets(admin_id)
-        if not targets:
-            return
-
-        # Check if the bot is stopped for this admin
-        is_working = await _get_cached_working_status(admin_id)
-        if not is_working:
-            logger.debug("Skipping forwarding for admin %s since bot is stopped (/stop).", admin_id)
-            return
-
-        rules = await _get_cached_filters(admin_id)
-        original_text = event.message.message or ""
-        original_entities = event.message.entities or []
-        filtered_text, filtered_entities = _apply_cached_filters_with_entities(
-            rules, original_text, original_entities
-        )
-
-        if filtered_text is None:
-            return  # Blocked by keyword filter
-
-        # ── APK block check ──────────────────────────────────────────────
-        if event.message.file and event.message.file.name:
-            if event.message.file.name.lower().endswith('.apk'):
-                if any(r["find_text"] == "<BLOCK_APK>" for r in rules):
-                    return
-
-        text_changed = filtered_text != original_text
-
-        logger.info(
-            "⚡ Forwarding msg from source (admin %s) → %d target(s) | media=%s | text_changed=%s",
-            admin_id, len(targets), bool(event.message.media), text_changed,
-        )
-
-        # ── Phase 1: Telethon-native fast path (instant, zero bandwidth) ─
-        fast_results = await asyncio.gather(
-            *[_fast_forward(client, t["channel_id"], event, filtered_text, filtered_entities, text_changed, admin_id)
-              for t in targets],
-            return_exceptions=True,
-        )
-
-        # ── Phase 2: Bot API fallback for failed targets ─────────────────
-        failed_ids = []
-        for i, r in enumerate(fast_results):
-            if isinstance(r, Exception):
-                failed_ids.append(targets[i]["channel_id"])
-                logger.warning(
-                    "Fast-path failed for target %s (admin %s): %s",
-                    targets[i]["channel_id"], admin_id, r,
-                )
-
-        if failed_ids:
-            logger.info(
-                "Using Bot API fallback for %d target(s) (admin %s)",
-                len(failed_ids), admin_id,
-            )
-            await _slow_forward(bot, event, filtered_text, failed_ids, admin_id)
-        else:
-            logger.info("✅ All %d target(s) forwarded via fast-path (admin %s)", len(targets), admin_id)
-
-    except Exception as exc:
-        logger.error("_process_and_forward error (admin %s): %s", admin_id, exc, exc_info=True)
+async def _enqueue_messages(client, bot, admin_id, source_id, messages):
+    messages = sorted(messages, key=lambda m: m.id)
+    group = messages[0].grouped_id
+    key = (source_id, "album", str(group)) if group else (source_id, "message", messages[0].id)
+    await _dispatcher.submit(admin_id, key,
+                             lambda: _deliver_messages(client, bot, admin_id, source_id, messages))
 
 
-async def _fast_forward(
-    client: TelegramClient,
-    target_id: int,
-    event,
-    filtered_text: str,
-    entities: list,
-    text_changed: bool,
-    admin_id: int,
-) -> None:
-    """
-    Telethon-native message delivery.
-    Sends message as:
-    1. A cloned message via `client.send_message(entity, event.message)` if text did NOT change.
-       This preserves premium animated stickers, custom emojis, formatting, and media perfectly
-       without any "Forwarded from" header, and uses server-side references (instant).
-    2. A new message (with filtered_text and aligned entities) if text DID change.
-    """
-    async def _send():
-        entity = await _get_target_entity(client, admin_id, target_id)
-        
-        # Scenario A: Text has NOT changed. We clone the original message object directly.
-        # This keeps premium stickers, custom emojis, formatting, and file references 100% intact.
-        if not text_changed:
-            try:
-                await client.send_message(entity, event.message)
-            except Exception as exc:
-                logger.info("Failed to clone message %s directly: %s. Retrying via download/upload.", event.message.id, exc)
-                # Fallback: if it fails (restricted channel, media reference expired), we download and upload.
-                if event.message.media:
-                    temp_dir = os.path.join(os.getcwd(), "scratch", "temp_media")
-                    os.makedirs(temp_dir, exist_ok=True)
-                    media_path = await event.message.download_media(file=temp_dir)
-                    try:
-                        await client.send_file(
-                            entity,
-                            file=media_path,
-                            caption=filtered_text or None,
-                            formatting_entities=entities,
-                        )
-                    except Exception as upload_exc:
-                        logger.error("Clone fallback upload failed for target %s: %s", target_id, upload_exc)
-                        raise upload_exc
-                    finally:
-                        if media_path and os.path.exists(media_path):
-                            try:
-                                os.remove(media_path)
-                            except Exception:
-                                pass
-                elif filtered_text:
-                    await client.send_message(
-                        entity,
-                        message=filtered_text,
-                        formatting_entities=entities,
-                    )
-        
-        # Scenario B: Text has changed. We must send a new message with the modified text/entities.
-        else:
-            if event.message.media:
-                try:
-                    # Try reusing server-side media reference first
-                    await client.send_file(
-                        entity,
-                        file=event.message.media,
-                        caption=filtered_text or None,
-                        formatting_entities=entities,
-                    )
-                except Exception as exc:
-                    # If that fails (restricted channel, expired reference), download and upload
-                    logger.info("Failed to copy media reference for %s: %s. Retrying via download/upload.", target_id, exc)
-                    temp_dir = os.path.join(os.getcwd(), "scratch", "temp_media")
-                    os.makedirs(temp_dir, exist_ok=True)
-                    media_path = await event.message.download_media(file=temp_dir)
-                    try:
-                        await client.send_file(
-                            entity,
-                            file=media_path,
-                            caption=filtered_text or None,
-                            formatting_entities=entities,
-                        )
-                    except Exception as upload_exc:
-                        logger.error("Download and upload failed for target %s: %s", target_id, upload_exc)
-                        raise upload_exc
-                    finally:
-                        if media_path and os.path.exists(media_path):
-                            try:
-                                os.remove(media_path)
-                            except Exception:
-                                pass
-            elif filtered_text:
-                await client.send_message(
-                    entity,
-                    message=filtered_text,
-                    formatting_entities=entities,
-                )
-
-    await asyncio.wait_for(_send(), timeout=30.0)
-
-
-
-async def _slow_forward(
-    bot,
-    event,
-    filtered_text: str,
-    target_ids: list[int],
-    admin_id: int,
-) -> None:
-    """
-    Fallback: download media ONCE, then re-upload via Bot API to all
-    failed targets. Only used when Telethon-native forwarding fails
-    (e.g. userbot doesn't have posting rights in the target channel).
-    """
-    media_path = None
-    if event.message.media:
-        try:
-            temp_dir = os.path.join(os.getcwd(), "scratch", "temp_media")
-            os.makedirs(temp_dir, exist_ok=True)
-            media_path = await event.message.download_media(file=temp_dir)
-        except Exception as e:
-            logger.error("Media download failed (admin %s): %s", admin_id, e)
-
-    try:
-        for target_id in target_ids:
-            try:
-                if media_path and os.path.exists(media_path):
-                    caption = filtered_text or None
-                    if event.message.sticker or media_path.lower().endswith(('.webm', '.tgs', '.webp')):
-                        try:
-                            with open(media_path, "rb") as f:
-                                await bot.send_sticker(chat_id=target_id, sticker=f)
-                        except Exception:
-                            logger.warning("Dropped invalid sticker for admin %s", admin_id)
-                    elif event.message.photo:
-                        with open(media_path, "rb") as f:
-                            await bot.send_photo(chat_id=target_id, photo=f, caption=caption)
-                    elif event.message.video:
-                        with open(media_path, "rb") as f:
-                            await bot.send_video(chat_id=target_id, video=f, caption=caption)
-                    elif event.message.audio:
-                        with open(media_path, "rb") as f:
-                            await bot.send_audio(chat_id=target_id, audio=f, caption=caption)
-                    elif event.message.voice:
-                        with open(media_path, "rb") as f:
-                            await bot.send_voice(chat_id=target_id, voice=f, caption=caption)
-                    elif event.message.video_note:
-                        with open(media_path, "rb") as f:
-                            await bot.send_video_note(chat_id=target_id, video_note=f)
-                    else:
-                        with open(media_path, "rb") as f:
-                            await bot.send_document(chat_id=target_id, document=f, caption=caption)
-                elif filtered_text:
-                    await bot.send_message(chat_id=target_id, text=filtered_text)
-            except Exception as exc:
-                logger.error("Bot API forward to %s failed (admin %s): %s", target_id, admin_id, exc)
-    finally:
-        if media_path and os.path.exists(media_path):
-            try:
-                os.remove(media_path)
-            except Exception:
-                pass
-
-
-async def _process_and_forward_album(
-    client: TelegramClient, bot, event, admin_id: int
-) -> None:
-    """Core forwarding pipeline for an incoming media group (album)."""
-    try:
-        # Check active status of admin bot
-        is_working = await _get_cached_working_status(admin_id)
-        if not is_working:
-            return
-
-        # Get targets and filters
-        targets = await _get_cached_targets(admin_id)
-        if not targets:
-            return
-
-        rules = await _get_cached_filters(admin_id)
-
-        # 1. Prepare lists of files, captions, and entities
-        files = []
-        captions = []
-        formatting_entities = []
-
-        # Iterate over the messages in the album
-        for msg in event.messages:
-            media = msg.media
-            if not media:
-                continue
-            files.append(media)
-
-            # Process text/caption with filters
-            orig_text = msg.message or ""
-            orig_entities = msg.entities or []
-            
-            # Apply filters
-            filtered_text, filtered_entities = _apply_cached_filters_with_entities(
-                rules, orig_text, orig_entities
-            )
-            
-            # If any item in the album matches a block filter, skip the whole album
-            if filtered_text is None:
-                logger.info("Album blocked by keyword filter for admin %s.", admin_id)
-                return
-
-            captions.append(filtered_text)
-            formatting_entities.append(filtered_entities)
-
-        # Check for APK blocking in any of the album files
-        for msg in event.messages:
-            if msg.file and msg.file.name:
-                if msg.file.name.lower().endswith('.apk'):
-                    if any(r["find_text"] == "<BLOCK_APK>" for r in rules):
-                        logger.info("Album blocked due to APK file filter for admin %s.", admin_id)
-                        return
-
-        logger.info(
-            "⚡ Forwarding album from source (admin %s) → %d target(s) | items=%d",
-            admin_id, len(targets), len(files)
-        )
-
-        # ── Fast path forwarding using userbot ───────────────────────────
-        async def _send_to_target(target_id: int):
-            entity = await _get_target_entity(client, admin_id, target_id)
-            await client.send_file(
-                entity,
-                file=files,
-                caption=captions,
-                formatting_entities=formatting_entities
-            )
-
-        fast_results = await asyncio.gather(
-            *[_send_to_target(t["channel_id"]) for t in targets],
-            return_exceptions=True,
-        )
-
-        # ── Slow path Bot API fallback ───────────────────────────────────
-        failed_ids = []
-        for i, r in enumerate(fast_results):
-            if isinstance(r, Exception):
-                failed_ids.append(targets[i]["channel_id"])
-                logger.warning(
-                    "Album fast-path failed for target %s (admin %s): %s",
-                    targets[i]["channel_id"], admin_id, r,
-                )
-
-        if failed_ids:
-            logger.info("Using Bot API fallback for album to %d target(s) (admin %s)", len(failed_ids), admin_id)
-            await _slow_forward_album(bot, event.messages, captions, formatting_entities, failed_ids, admin_id)
-        else:
-            logger.info("✅ Album forwarded to all %d target(s) via fast-path (admin %s)", len(targets), admin_id)
-
-    except Exception as exc:
-        logger.error("_process_and_forward_album error (admin %s): %s", admin_id, exc, exc_info=True)
-
-
-async def _slow_forward_album(
-    bot,
-    messages,
-    captions: list[str],
-    formatting_entities: list[list],
-    target_ids: list[int],
-    admin_id: int,
-) -> None:
-    """
-    Fallback: download album media locally, then upload via Bot API send_media_group.
-    """
-    from telegram import InputMediaPhoto, InputMediaVideo
-    media_paths = []
-    
-    # 1. Download all files
-    temp_dir = os.path.join(os.getcwd(), "scratch", "temp_media")
-    os.makedirs(temp_dir, exist_ok=True)
-    
+async def _deliver_messages(client, bot, admin_id, source_id, messages):
+    if not await _get_cached_working_status(admin_id):
+        return
+    targets = await _get_cached_targets(admin_id)
+    rules = await _get_cached_filters(admin_id)
+    prepared = []
     for msg in messages:
-        if not msg.media:
-            continue
-        try:
-            path = await msg.download_media(file=temp_dir)
-            media_paths.append((msg, path))
-        except Exception as e:
-            logger.error("Media download failed for album item %s (admin %s): %s", msg.id, admin_id, e)
-
-    if not media_paths:
+        if getattr(msg, "action", None):
+            continue  # Service messages are not copyable content.
+        if msg.file and msg.file.name and msg.file.name.lower().endswith('.apk'):
+            if any(r['find_text'] == '<BLOCK_APK>' for r in rules):
+                return
+        text, entities = _apply_cached_filters_with_entities(rules, msg.message or '', msg.entities or [])
+        if text is None:
+            return
+        prepared.append((msg, text, entities))
+    if not prepared:
         return
 
-    # Keep file descriptors open during sending
-    open_files = []
-    try:
-        # 2. Build the list of InputMedia objects
-        media_group = []
-        for i, (msg, path) in enumerate(media_paths):
-            if not path or not os.path.exists(path):
-                continue
-            
-            f = open(path, "rb")
-            open_files.append(f)
-            
-            caption = captions[i] if i < len(captions) and captions[i] else None
-            
-            if msg.photo:
-                media_group.append(InputMediaPhoto(media=f, caption=caption))
-            elif msg.video:
-                media_group.append(InputMediaVideo(media=f, caption=caption))
-            else:
-                media_group.append(InputMediaPhoto(media=f, caption=caption))
-
-        if not media_group:
+    async def deliver(target):
+        target_id = target['channel_id']
+        if target_id == source_id:
+            logger.error("Skipping source-to-itself route for admin %s", admin_id)
             return
+        async with _target_slots:
+            await _deliver_target(client, bot, admin_id, target_id, prepared)
 
-        # 3. Send media group to all failed targets
-        for target_id in target_ids:
-            try:
-                for f in open_files:
-                    f.seek(0)
-                await bot.send_media_group(chat_id=target_id, media=media_group)
-            except Exception as exc:
-                logger.error("Bot API send_media_group to %s failed (admin %s): %s", target_id, admin_id, exc)
-
-    finally:
-        for f in open_files:
-            try:
-                f.close()
-            except Exception:
-                pass
-        for _, path in media_paths:
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
+    failed = []
+    for offset in range(0, len(targets), 8):
+        batch = targets[offset:offset + 8]
+        results = await asyncio.gather(*(deliver(t) for t in batch), return_exceptions=True)
+        failed.extend((t['channel_id'], r) for t, r in zip(batch, results) if isinstance(r, BaseException))
+    for tid, error in failed:
+        logger.error("Delivery failed: admin=%s source=%s message=%s target=%s error=%s",
+                     admin_id, source_id, messages[0].id, tid, type(error).__name__)
+    if failed:
+        raise RuntimeError(f"Delivery failed for {len(failed)} of {len(targets)} targets")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Lifecycle helpers
+async def _deliver_target(client, bot, admin_id, target_id, prepared):
+    from telethon.errors import ChatWriteForbiddenError, ChannelPrivateError, UserBannedInChannelError
+    async def native_send():
+        entity = await _get_target_entity(client, admin_id, target_id)
+        if len(prepared) > 1:
+            await client.send_file(entity, file=[m.media for m, _, _ in prepared],
+                                   caption=[text for _, text, _ in prepared],
+                                   formatting_entities=[ents for _, _, ents in prepared], parse_mode=None)
+        else:
+            msg, text, entities = prepared[0]
+            unchanged = text == (msg.message or '') and [e.to_dict() for e in entities] == [e.to_dict() for e in (msg.entities or [])]
+            if unchanged:
+                await client.send_message(entity, msg)
+            elif msg.media and not getattr(msg, 'web_preview', None):
+                await client.send_file(entity, file=msg.media, caption=text,
+                                       formatting_entities=entities, parse_mode=None)
+            elif text:
+                await client.send_message(entity, text, formatting_entities=entities, parse_mode=None)
+
+    try:
+        await send_with_retry(native_send)
+    except (TargetResolutionError, ChatWriteForbiddenError, ChannelPrivateError, UserBannedInChannelError):
+        # Only explicit permission rejection is safe to retry through another
+        # transport. A timeout may already have delivered the original request.
+        await _bot_fallback(bot, target_id, prepared)
+
+
+async def _bot_fallback(bot, target_id, prepared):
+    """Copy with Bot API first, then upload once per rejected target if necessary."""
+    from contextlib import ExitStack
+    from tempfile import TemporaryDirectory
+    from telegram import InputMediaPhoto, InputMediaVideo, InputMediaAudio, InputMediaDocument
+    from telegram.error import BadRequest
+    from bot.utils.formatting import to_bot_entities
+
+    async def copy():
+        if len(prepared) > 1:
+            # CopyMessages cannot replace captions, so edited albums use upload.
+            if any(text != (msg.message or '') or [e.to_dict() for e in ents] != [e.to_dict() for e in (msg.entities or [])] for msg, text, ents in prepared):
+                raise ValueError('Album captions require upload')
+            result = await bot.copy_messages(chat_id=target_id, from_chat_id=prepared[0][0].chat_id,
+                                            message_ids=[m.id for m, _, _ in prepared])
+            if len(result) != len(prepared):
+                # Some messages may have arrived: do not retry the whole album.
+                raise RuntimeError('Telegram copied only part of the album')
+        else:
+            msg, text, entities = prepared[0]
+            if not msg.media or getattr(msg, 'web_preview', None):
+                if text:
+                    await bot.send_message(chat_id=target_id, text=text,
+                                           entities=to_bot_entities(entities), parse_mode=None)
+            else:
+                kwargs = {}
+                if text != (msg.message or '') or [e.to_dict() for e in entities] != [e.to_dict() for e in (msg.entities or [])]:
+                    kwargs = {'caption': text, 'caption_entities': to_bot_entities(entities), 'parse_mode': None}
+                await bot.copy_message(chat_id=target_id, from_chat_id=msg.chat_id, message_id=msg.id, **kwargs)
+    try:
+        await send_with_retry(copy)
+        return
+    except (BadRequest, ValueError) as exc:
+        # Permission/protection failures are not solved by downloading content.
+        if isinstance(exc, BadRequest) and not any(
+            phrase in str(exc).lower() for phrase in ('message to copy not found', 'chat not found')
+        ):
+            raise
+    if any(getattr(m, 'noforwards', False) for m, _, _ in prepared):
+        raise RuntimeError('Protected content cannot be copied')
+    # Private directory per operation prevents concurrent downloads overwriting files.
+    with TemporaryDirectory(prefix='tg-forward-') as temp_dir, ExitStack() as stack:
+        media = []
+        for i, (msg, text, entities) in enumerate(prepared):
+            path = await msg.download_media(file=os.path.join(temp_dir, str(i)) + '/')
+            if not path:
+                raise RuntimeError('Media download returned no file')
+            handle = stack.enter_context(open(path, 'rb'))
+            kwargs = {'media': handle, 'caption': text or None,
+                      'caption_entities': to_bot_entities(entities), 'parse_mode': None}
+            kind = (InputMediaPhoto if msg.photo else InputMediaVideo if msg.video
+                    else InputMediaAudio if msg.audio else InputMediaDocument)
+            media.append(kind(**kwargs))
+        async def upload():
+            if len(media) > 1:
+                await bot.send_media_group(chat_id=target_id, media=media)
+            else:
+                msg, text, entities = prepared[0]
+                item = media[0]
+                kwargs = {'chat_id': target_id}
+                if msg.sticker:
+                    await bot.send_sticker(sticker=item.media, **kwargs)
+                elif msg.video_note:
+                    await bot.send_video_note(video_note=item.media, **kwargs)
+                else:
+                    kwargs.update(caption=text or None, caption_entities=to_bot_entities(entities), parse_mode=None)
+                    method, name = ((bot.send_photo, 'photo') if msg.photo else
+                                    (bot.send_animation, 'animation') if msg.gif else
+                                    (bot.send_video, 'video') if msg.video else
+                                    (bot.send_audio, 'audio') if msg.audio else
+                                    (bot.send_voice, 'voice') if msg.voice else (bot.send_document, 'document'))
+                    await method(**{name: item.media}, **kwargs)
+        await send_with_retry(upload)
+
+
+# # Lifecycle helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def restart_userbot_listener(admin_id: int, bot) -> None:
@@ -1070,6 +743,10 @@ async def restart_userbot_listener(admin_id: int, bot) -> None:
 
 
 async def stop_userbot(admin_id: int) -> None:
+    client = _clients.pop(admin_id, None)
+    if client:
+        for listener in _listeners.pop(admin_id, []):
+            client.remove_event_handler(listener)
     # Cancel all background tasks first so they don't get "destroyed while pending"
     for task in _tasks.pop(admin_id, []):
         if not task.done():
@@ -1079,7 +756,9 @@ async def stop_userbot(admin_id: int) -> None:
             except (asyncio.CancelledError, Exception):
                 pass
 
-    client = _clients.pop(admin_id, None)
+    await _dispatcher.stop(admin_id)
+    invalidate_cache(admin_id)
+    _poll_cursors.pop(admin_id, None)
     if client:
         try:
             await client.disconnect()
@@ -1091,16 +770,16 @@ async def start_all_userbots(bot) -> None:
     try:
         from bot.db.supabase_client import get_client
         db = get_client()
-        res = db.table("users").select("user_id, session_string").neq("session_string", None).execute()
+        res = await asyncio.to_thread(lambda: db.table("users").select("user_id, session_string").not_.is_("session_string", "null").execute())
         data = getattr(res, "data", [])
         if isinstance(data, list):
             for row in data:
                 if isinstance(row, dict) and row.get("session_string"):
                     await start_userbot(row["user_id"], bot)
-    except Exception as e:
-        logger.debug("start_all_userbots DB query failed: %s", e)
+    except Exception:
+        logger.exception("Could not load userbot sessions from database")
 
-    for fname in os.listdir(_session_dir):
+    for fname in os.listdir(_session_dir) if os.path.isdir(_session_dir) else []:
         if fname.endswith(".session_str"):
             try:
                 admin_id = int(fname.replace("admin_", "").replace(".session_str", ""))
@@ -1113,3 +792,14 @@ async def start_all_userbots(bot) -> None:
 async def stop_all_userbots() -> None:
     for admin_id in list(_clients.keys()):
         await stop_userbot(admin_id)
+    for admin_id in list(_pending_auth):
+        await clear_pending_auth(admin_id)
+
+
+def is_userbot_running(admin_id: int) -> bool:
+    client = _clients.get(admin_id)
+    return bool(client and client.is_connected() and admin_id in _poll_cursors)
+
+
+def delivery_status(admin_id: int | None = None) -> dict:
+    return _dispatcher.snapshot(admin_id)

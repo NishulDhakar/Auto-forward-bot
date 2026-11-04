@@ -1,10 +1,10 @@
+import asyncio
 """
 bot/handlers/help.py
 Help menu and step-by-step tutorial handlers with Premium custom emojis.
 """
 
 import logging
-import os
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
@@ -48,7 +48,7 @@ async def _send_help_screen(update: Update, image_name: str, text: str) -> None:
     msg = update.effective_message
     keyboard = get_help_keyboard()
     image_path = IMAGES_DIR / image_name
-    
+
     file_id = _PHOTO_CACHE.get(image_name)
 
     try:
@@ -95,7 +95,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"{BULLET} 3. /addtarget — Pick where messages go\n\n"
         f"Click the buttons below to see detailed tutorials {ARROW}"
     )
-    text = get_content("help_msg", default_text)
+    text = (await asyncio.to_thread(get_content, "help_msg", default_text))
     await _send_help_screen(update, "welcome.png", text)
 
 async def howtoauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -108,7 +108,7 @@ async def howtoauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"{BULLET} If you have 2-Step Verification enabled, it will ask for your password.\n\n"
         f"{CHECK} Once done, your account is linked and ready to forward!"
     )
-    text = get_content("howtoauth", default_text)
+    text = (await asyncio.to_thread(get_content, "howtoauth", default_text))
     await _send_help_screen(update, "auth.png", text)
 
 async def howtoaddforwarding_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -119,7 +119,7 @@ async def howtoaddforwarding_command(update: Update, context: ContextTypes.DEFAU
         f"{BULLET} You can add multiple targets by repeating /addtarget.\n\n"
         f"{CHECK} The bot will now instantly copy any new message from your Source to all your Targets!"
     )
-    text = get_content("howtoaddforwarding", default_text)
+    text = (await asyncio.to_thread(get_content, "howtoaddforwarding", default_text))
     await _send_help_screen(update, "set_forwarding.png", text)
 
 async def howtosetfilter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -132,7 +132,7 @@ async def howtosetfilter_command(update: Update, context: ContextTypes.DEFAULT_T
         f"{BULLET} <b>Block Words:</b> Choose 'Block Message if Contains', provide a word. If the source message has this word, it will <b>not</b> be forwarded.\n\n"
         f"{THUMB} Use /myfilters to see or delete your active rules."
     )
-    text = get_content("howtosetfilter", default_text)
+    text = (await asyncio.to_thread(get_content, "howtosetfilter", default_text))
     await _send_help_screen(update, "filter.png", text)
 
 async def howtoschedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -144,7 +144,7 @@ async def howtoschedule_command(update: Update, context: ContextTypes.DEFAULT_TY
         f"{BULLET} Choose if it should repeat 'Daily' or just run 'One-time'.\n\n"
         f"{CHECK} Use /removeschedule to cancel scheduled messages."
     )
-    text = get_content("howtoschedule", default_text)
+    text = (await asyncio.to_thread(get_content, "howtoschedule", default_text))
     await _send_help_screen(update, "schedule.png", text)
 
 async def howtopro_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -157,15 +157,15 @@ async def howtopro_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"{CHECK} Click \"I've Paid\" and contact support with your screenshot if required.\n\n"
         f"{HSHAKE} Premium unlocks all advanced features {HEART}"
     )
-    text = get_content("howtopro", default_text)
+    text = (await asyncio.to_thread(get_content, "howtopro", default_text))
     await _send_help_screen(update, "pro.png", text)
 
 async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    
+
     cmd = query.data.split(":", 1)[1]
-    
+
     if cmd == "/howtoauth":
         await howtoauth_command(update, context)
     elif cmd == "/howtoaddforwarding":

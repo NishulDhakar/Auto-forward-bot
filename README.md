@@ -2,7 +2,7 @@
 
 ![Welcome](images/welcome.png)
 
-A production-ready Telegram bot that acts as your personal automated forwarding assistant. Built with **python-telegram-bot v20+**, **Telethon** (Userbot), and **Supabase**, this bot offers role-based access control, real-time message forwarding from both public and private channels, advanced dynamic text filters, message scheduling, and an integrated premium subscription system.
+A Telegram bot that acts as your personal automated forwarding assistant. Built with **python-telegram-bot v20+**, **Telethon** (Userbot), and **Supabase**, this bot offers role-based access control, real-time message forwarding from both public and private channels, advanced dynamic text filters, message scheduling, and an integrated premium subscription system.
 
 ---
 
@@ -72,7 +72,7 @@ BOT_TOKEN=your_bot_token_here         # From @BotFather
 TELEGRAM_API_ID=1234567               # From my.telegram.org
 TELEGRAM_API_HASH=your_api_hash       # From my.telegram.org
 SUPABASE_URL=https://xxx.supabase.co  # Your Supabase project URL
-SUPABASE_KEY=your_supabase_key_here   # anon or service_role key
+SUPABASE_KEY=your_supabase_key_here   # Server-side service_role key (keep private)
 SUPER_ADMIN_ID=123456789              # Your Telegram user ID
 RAZORPAY_KEY_ID=optional_key          # For automated INR payments
 RAZORPAY_KEY_SECRET=optional_secret
@@ -80,7 +80,14 @@ RAZORPAY_KEY_SECRET=optional_secret
 
 ### 3. Set up Supabase Database
 1. Open your [Supabase project](https://supabase.com) → SQL Editor
-2. Run the provided `supabase_schema.sql` script to create the tables.
+2. Run these scripts **in order** in the SQL Editor:
+   - `supabase_schema.sql`
+   - `migration_payment_system.sql`
+   - `migration_webhook_support.sql`
+   - `migration_work_stop.sql`
+   - `migration_reliability.sql`
+3. Configure a server-side **service_role** key. The reliability migration restricts public database access and installs the atomic payment activation function. An anon key will no longer work.
+4. For an existing installation, apply only missing migrations. Reconcile old payment markers against Razorpay before enabling automated billing. See [the deployment notes](docs/AUDIT_AND_ROADMAP.md).
 
 ### 4. Run the Bot
 ```bash
@@ -120,3 +127,26 @@ python3 -m bot.main
 | `/help` | Interactive step-by-step image tutorials |
 | `/pro` | View premium subscription plans and purchase |
 | `/plan` | View current trial or subscription status |
+
+
+## Reliability update and verification
+
+Read the [audit, research and improvement roadmap](docs/AUDIT_AND_ROADMAP.md) for findings, implementation details and remaining limits.
+
+- Bounded per-account delivery queues, duplicate suppression and album-aware recovery polling.
+- Threaded database operations keep forwarding responsive while commands use Supabase.
+- Shared filtering preserves emoji offsets, updates hidden links and blocks matching posts consistently.
+- Only explicit Telegram rate-limit rejections are retried automatically. Ambiguous timeouts are recorded for review.
+- Payment signatures fail closed; button verification and webhooks share an atomic payment-ID transaction.
+- Admin actions run in private chats; filter and schedule deletion check ownership.
+- `/mystatus` reports the listener connection, queue depth and recent delivery failures. `/work` also attempts to start a saved session.
+
+Run the offline checks without contacting Telegram or Supabase:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python scripts/benchmark_delivery.py
+.venv/bin/python -m compileall -q bot
+```
+
+The forwarding queue and poll cursor are currently in memory. A process crash or outage can still lose pending userbot deliveries; persistent delivery tracking is the next priority. End-to-end delivery and the database migration require validation in a staging environment before deployment.

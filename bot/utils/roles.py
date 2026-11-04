@@ -12,6 +12,8 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
+
 import functools
 import logging
 from datetime import datetime, timezone
@@ -107,25 +109,21 @@ def require_admin(func: Callable) -> Callable:
         user_id = _get_user_id(update)
         if user_id is None:
             return
+        if update.effective_chat and update.effective_chat.type != "private":
+            if update.effective_message:
+                await update.effective_message.reply_text("Please use this command in a private chat with the bot.")
+            return ConversationHandler.END
 
         if user_id == SUPER_ADMIN_ID:
             return await func(update, context, *args, **kwargs)
 
-        user = users_db.get_user(user_id)
+        user = (await asyncio.to_thread(users_db.get_user, user_id))
         if user is None:
             if update.message:
                 await update.message.reply_text("❌ You are not registered. Send /start first.")
             return ConversationHandler.END
 
         if not is_admin_active(user):
-            sa_uname = "superadmin"
-            try:
-                sa = users_db.get_user(SUPER_ADMIN_ID)
-                if sa and sa.get("username"):
-                    sa_uname = sa["username"]
-            except Exception:
-                pass
-
             msg = (
                 "⭐ *Premium Plan Required*\n\n"
                 "This feature is restricted to active subscribers.\n\n"

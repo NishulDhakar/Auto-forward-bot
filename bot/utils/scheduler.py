@@ -11,8 +11,8 @@ Design:
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import datetime, timezone
 
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -21,8 +21,8 @@ from telegram import Bot
 
 from bot.db.channels import get_target_channels
 from bot.db.schedules import deactivate_schedule, get_all_active_schedules
-from bot.db.users import get_expired_admins, set_role, revoke_subscription
-from bot.db.users import get_user
+from bot.db.users import get_expired_admins, revoke_subscription
+from bot.utils.delivery import send_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -66,23 +66,25 @@ async def _send_scheduled_message(
         logger.info("Schedule %s fired but admin %s has stopped the bot (/stop). Skipping.", schedule_id, admin_id)
         return
 
-    targets = get_target_channels(admin_id)
+    targets = await asyncio.to_thread(get_target_channels, admin_id)
     if not targets:
         logger.warning("Schedule %s fired but admin %s has no target channels.", schedule_id, admin_id)
         return
 
+    failed = False
     for target in targets:
         try:
-            await bot.send_message(chat_id=target["channel_id"], text=content)
+            await send_with_retry(lambda: bot.send_message(chat_id=target["channel_id"], text=content))
         except Exception as exc:
+            failed = True
             logger.error(
                 "Failed to send scheduled msg %s to channel %s: %s",
                 schedule_id, target["channel_id"], exc,
             )
 
     # For one-time jobs, deactivate after first fire
-    if frequency == "once":
-        deactivate_schedule(schedule_id)
+    if frequency == "once" and not failed:
+        await asyncio.to_thread(deactivate_schedule, schedule_id)
         _remove_job_if_exists(f"sched_{schedule_id}")
         logger.info("One-time schedule %s deactivated.", schedule_id)
 
@@ -145,12 +147,12 @@ def _remove_job_if_exists(job_id: str) -> None:
 # Bootstrap on startup
 # ─────────────────────────────────────────────────────────────────────────────
 
-def bootstrap_schedules(bot: Bot) -> None:
+async def bootstrap_schedules(bot: Bot) -> None:
     """
     Reload all active DB schedules into APScheduler.
     Call this once after the scheduler is started.
     """
-    schedules = get_all_active_schedules()
+    schedules = await asyncio.to_thread(get_all_active_schedules)
     for sched in schedules:
         schedule_message(
             bot=bot,
@@ -172,10 +174,13 @@ async def _check_expired_subscriptions(bot: Bot) -> None:
     Runs every hour. Demotes admins whose subscription_end has passed.
     Clears all subscription fields and sends a notification to the user.
     """
-    expired = get_expired_admins()
+    expired = await asyncio.to_thread(get_expired_admins)
     for user in expired:
         user_id = user["user_id"]
-        revoke_subscription(user_id)  # clears role + all subscription/payment fields
+        await asyncio.to_thread(revoke_subscription, user_id)
+        from bot.utils import userbot_manager
+        userbot_manager.invalidate_cache(user_id)
+        await userbot_manager.stop_userbot(user_id)
         logger.info("Auto-demoted admin %s (subscription expired).", user_id)
         try:
             await bot.send_message(
@@ -203,3 +208,11 @@ def start_expiry_checker(bot: Bot) -> None:
         misfire_grace_time=300,
     )
     logger.info("Subscription expiry checker registered (hourly).")
+
+
+def stop_scheduler() -> None:
+    """Stop producing jobs before shutting down Telegram clients."""
+    global _scheduler
+    if _scheduler is not None and _scheduler.running:
+        _scheduler.shutdown(wait=False)
+    _scheduler = None
