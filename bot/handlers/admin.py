@@ -20,6 +20,7 @@ import asyncio
 import re
 import warnings
 from datetime import datetime, timezone, timedelta
+from html import escape
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -425,69 +426,113 @@ async def _check_authorized(update: Update, admin_id: int) -> bool:
     return True
 
 
-async def _get_dialogs_keyboard_and_text(admin_id: int, bot, prefix: str) -> tuple[str, InlineKeyboardMarkup, list[dict]] | None:
+_DIALOG_PAGE_SIZE = 10
+
+
+async def _load_dialog_page(picker: dict, page: int) -> None:
+    """Load one page plus a lookahead chat, keeping selection indexes stable."""
+    required = (page + 1) * _DIALOG_PAGE_SIZE + 1
+    while not picker["exhausted"] and len(picker["dialogs"]) < required:
+        try:
+            dialog = await anext(picker["iterator"])
+        except StopAsyncIteration:
+            picker["exhausted"] = True
+            break
+        if dialog.is_user and getattr(dialog.entity, "bot", False) and dialog.entity.id == picker["bot_id"]:
+            continue
+        picker["dialogs"].append({
+            "id": dialog.id,
+            "name": dialog.name or "Unnamed Chat",
+            "username": getattr(dialog.entity, "username", None),
+        })
+
+
+def _render_dialog_page(picker: dict, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    dialogs = picker["dialogs"]
+    prefix = picker["prefix"]
+    start = page * _DIALOG_PAGE_SIZE
+    stop = min(start + _DIALOG_PAGE_SIZE, len(dialogs))
+    keyboard = []
+    if dialogs:
+        destination = "Source" if prefix == "srcsel" else "Target"
+        lines = [f"✉️ <b>Select Your {destination}</b>", "──────────────────────────"]
+        for index in range(start, stop):
+            # Chat titles are arbitrary text and may contain markup or newlines.
+            name = escape(" ".join(dialogs[index]["name"].split())[:150])
+            lines.append(f"{index + 1}. {name}")
+        lines.append(f"\nShowing chats {start + 1}–{stop}. Tap a number below.")
+        for row_start in range(start, stop, 5):
+            keyboard.append([
+                InlineKeyboardButton(str(index + 1), callback_data=f"{prefix}:{index}")
+                for index in range(row_start, min(row_start + 5, stop))
+            ])
+        navigation = []
+        if page > 0:
+            navigation.append(InlineKeyboardButton("⬅️ Previous 10", callback_data=f"dialogpage:{prefix}:{page - 1}"))
+        if stop < len(dialogs):
+            navigation.append(InlineKeyboardButton("Show 10 more ➡️", callback_data=f"dialogpage:{prefix}:{page + 1}"))
+        if navigation:
+            keyboard.append(navigation)
+        message_text = "\n".join(lines)
+    else:
+        message_text = "📭 No channels, groups, or chats found in your account."
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")])
+    return message_text, InlineKeyboardMarkup(keyboard)
+
+
+async def _get_dialogs_keyboard_and_text(admin_id: int, bot, prefix: str, user_data: dict) -> tuple[str, InlineKeyboardMarkup, list[dict]] | None:
     client = await userbot_manager.start_userbot(admin_id, bot)
     if not client:
         return None
 
     try:
-        dialogs = await client.get_dialogs(limit=80)
+        picker = {
+            "iterator": client.iter_dialogs().__aiter__(),
+            "dialogs": [], "prefix": prefix, "page": 0,
+            "exhausted": False, "bot_id": bot.id,
+        }
+        await _load_dialog_page(picker, 0)
     except Exception as e:
         logger.error("Error fetching dialogs for %s: %s", admin_id, e)
         return None
 
-    temp_dialogs = []
-    text_lines = []
-    
-    for d in dialogs:
-        name = d.name or "Unnamed Chat"
-        username = getattr(d.entity, "username", None)
-        if d.is_user and d.entity.bot and d.entity.id == bot.id:
-            continue
-            
-        temp_dialogs.append({
-            "id": d.id,
-            "name": name,
-            "username": username
-        })
-        
-        num = len(temp_dialogs)
-        text_lines.append(f"{num}. {name}")
+    user_data["dialog_picker"] = picker
+    message_text, keyboard = _render_dialog_page(picker, 0)
+    return message_text, keyboard, picker["dialogs"]
 
-    if not temp_dialogs:
-        return "📭 No channels, groups, or chats found in your account.", InlineKeyboardMarkup([]), []
 
-    header = "✉️ *Select the Number Below to Set Your Source*" if prefix == "srcsel" else "✉️ *Select the Number Below to Set Your Target*"
-    message_text = f"{header}\n──────────────────────────\n" + "\n".join(text_lines)
-    
-    if len(message_text) > 4000:
-        truncated_lines = []
-        truncated_dialogs = []
-        current_len = len(header) + 30
-        for i, line in enumerate(text_lines):
-            line_len = len(line) + 1
-            if current_len + line_len > 4000:
-                break
-            truncated_lines.append(line)
-            truncated_dialogs.append(temp_dialogs[i])
-            current_len += line_len
-        temp_dialogs = truncated_dialogs
-        message_text = f"{header}\n──────────────────────────\n" + "\n".join(truncated_lines)
-
-    keyboard = []
-    row = []
-    for i in range(len(temp_dialogs)):
-        num = i + 1
-        row.append(InlineKeyboardButton(str(num), callback_data=f"{prefix}:{i}"))
-        if len(row) == 5:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-        
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")])
-
-    return message_text, InlineKeyboardMarkup(keyboard), temp_dialogs
+@require_admin
+async def dialog_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    picker = context.user_data.get("dialog_picker")
+    if not picker:
+        await query.answer("This list expired. Open Add Source or Add Target again.", show_alert=True)
+        return ConversationHandler.END
+    state = ADD_SOURCE_WAIT if picker["prefix"] == "srcsel" else ADD_TARGET_WAIT
+    try:
+        _, prefix, page_text = query.data.split(":")
+        page = int(page_text)
+    except (ValueError, AttributeError):
+        await query.answer("Invalid page.", show_alert=True)
+        return state
+    current_page = picker["page"]
+    if (prefix != picker["prefix"] or page < 0 or abs(page - current_page) > 1
+            or (page > current_page and len(picker["dialogs"]) <= page * _DIALOG_PAGE_SIZE)):
+        await query.answer("That page is unavailable.", show_alert=True)
+        return state
+    await query.answer()
+    if page == current_page:
+        return state
+    try:
+        await _load_dialog_page(picker, page)
+    except Exception:
+        logger.exception("Could not load another chat page for admin %s", query.from_user.id)
+        await query.message.reply_text("Couldn't load more chats. Please try the button again.")
+        return state
+    text, keyboard = _render_dialog_page(picker, page)
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
+    picker["page"] = page
+    return state
 
 
 async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -511,7 +556,7 @@ async def addsource_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     loading_msg = await update.message.reply_text("🔄 Fetching your channels/groups/chats...")
 
-    res = await _get_dialogs_keyboard_and_text(admin_id, context.bot, "srcsel")
+    res = await _get_dialogs_keyboard_and_text(admin_id, context.bot, "srcsel", context.user_data)
     if res:
         msg_text, reply_markup, temp_dialogs = res
         context.user_data["temp_dialogs"] = temp_dialogs
@@ -519,7 +564,7 @@ async def addsource_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(
             msg_text,
             reply_markup=reply_markup,
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
     else:
         await loading_msg.delete()
@@ -652,7 +697,7 @@ async def addtarget_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     loading_msg = await update.message.reply_text("🔄 Fetching your channels/groups/chats...")
 
-    res = await _get_dialogs_keyboard_and_text(admin_id, context.bot, "tgtsel")
+    res = await _get_dialogs_keyboard_and_text(admin_id, context.bot, "tgtsel", context.user_data)
     if res:
         msg_text, reply_markup, temp_dialogs = res
         context.user_data["temp_dialogs"] = temp_dialogs
@@ -660,7 +705,7 @@ async def addtarget_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(
             msg_text,
             reply_markup=reply_markup,
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
     else:
         await loading_msg.delete()
@@ -1325,6 +1370,7 @@ def register(application) -> None:
         states={
             ADD_SOURCE_WAIT: [
                 CallbackQueryHandler(cancel_callback, pattern=r"^cancel_action$"),
+                CallbackQueryHandler(dialog_page_callback, pattern=r"^dialogpage:srcsel:\d+$"),
                 CallbackQueryHandler(addsource_callback, pattern=r"^srcsel:"),
                 MessageHandler(filters.ALL & ~filters.COMMAND, addsource_receive),
             ],
@@ -1342,6 +1388,7 @@ def register(application) -> None:
         states={
             ADD_TARGET_WAIT: [
                 CallbackQueryHandler(cancel_callback, pattern=r"^cancel_action$"),
+                CallbackQueryHandler(dialog_page_callback, pattern=r"^dialogpage:tgtsel:\d+$"),
                 CallbackQueryHandler(addtarget_callback, pattern=r"^tgtsel:"),
                 MessageHandler(filters.ALL & ~filters.COMMAND, addtarget_receive),
             ],

@@ -33,6 +33,7 @@ To forward messages from private channels, the bot securely links to your Telegr
 ![Set Forwarding](images/set_forwarding.png)
 - Run `/addsource` and provide the channel username or ID to copy *from*.
 - Run `/addtarget` to specify where messages should be forwarded *to*. You can add multiple targets!
+- Both chat pickers show 10 chats at a time. Use **Show 10 more** and **Previous 10** to browse your chats.
 
 ### 3. Set Up Dynamic Filters (`/howtosetfilter`)
 ![Filters](images/filter.png)
