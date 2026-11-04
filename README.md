@@ -1,7 +1,5 @@
 # Auto Forward Bot Pro
 
-![Welcome](images/welcome.png)
-
 A Telegram bot that acts as your personal automated forwarding assistant. Built with **python-telegram-bot v20+**, **Telethon** (Userbot), and **Supabase**, this bot offers role-based access control, real-time message forwarding from both public and private channels, advanced dynamic text filters, message scheduling, and an integrated premium subscription system.
 
 ---
