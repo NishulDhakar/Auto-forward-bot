@@ -29,6 +29,10 @@ TELEGRAM_API_HASH: str = os.getenv("TELEGRAM_API_HASH", "")
 RAZORPAY_KEY_ID: str = os.getenv("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET: str = os.getenv("RAZORPAY_KEY_SECRET", "")
 RAZORPAY_WEBHOOK_SECRET: str = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
+# ── Groq support agent ────────────────────────────────────────────────────────
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
 
 # ── Webhook Server ──────────────────────────────────────────────────
 WEBHOOK_PORT: int = int(os.getenv("WEBHOOK_PORT", "8080"))

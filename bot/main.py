@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from telegram.ext import Application
 
 from bot.config import BOT_TOKEN
-from bot.handlers import admin, forwarding, superadmin, user, payment, help, referral
+from bot.handlers import admin, forwarding, superadmin, user, payment, help, referral, agent
 from bot.utils import userbot_manager
 from bot.utils.scheduler import (
     bootstrap_schedules,
@@ -166,6 +166,7 @@ def build_application() -> Application:
     # 4.5. Help handlers
     help.register(app)
     referral.register(app)
+    agent.register(app)
 
     # 4.6. Fallback handler for unregistered commands/messages
     user.register_fallback(app)

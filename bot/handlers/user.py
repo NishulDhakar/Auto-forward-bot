@@ -275,29 +275,14 @@ def register(application) -> None:
 
 
 async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Catch-all handler for unauthorized users or unrecognized messages/commands."""
-    # Only handle text messages sent by users
+    """Route unrecognized private messages to the conversational support agent."""
     if not update.message or not update.message.text:
         return
-
-    # Check if the chat is a private chat (don't reply to group messages)
     if update.effective_chat.type != "private":
         return
 
-    user_id = update.effective_user.id
-    # Check if userbot is authorized
-    if not (await asyncio.to_thread(userbot_manager.is_userbot_authorized, user_id)):
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔐 Login Now", callback_data="auth_login")]
-        ])
-        await update.message.reply_text(
-            "<b>Best Auto Forwarding Bot</b>\n"
-            "❌ You Are Not Logged In.\n\n"
-            "Please Login to Use Bot 👇",
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
-
+    from bot.handlers.agent import handle_agent_message
+    await handle_agent_message(update, context)
 
 def register_fallback(application) -> None:
     application.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, fallback_handler))

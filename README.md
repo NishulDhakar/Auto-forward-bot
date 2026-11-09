@@ -48,6 +48,19 @@ To forward messages from private channels, the bot securely links to your Telegr
 - Run `/pro` to view subscription plans.
 - Pay via INR (UPI/Razorpay) or Crypto (USDT) and confirm payment directly inside the bot.
 
+### Conversational support agent
+Add `GROQ_API_KEY` to `.env` to enable the agent. Users can send `/ask` (or `/agent`) and then describe
+their problem; ordinary private text messages are also handled conversationally. The agent reads the
+user's current role and subscription state:
+
+- Free users receive general guidance and are directed to `/pro` for paid-only forwarding setup.
+- Active paid users receive step-by-step help for `/authorize`, `/addsource`, `/addtarget`, `/filter`,
+  `/schedule`, `/work`, and `/mystatus`.
+
+`GROQ_MODEL` is optional and defaults to `llama-3.3-70b-versatile`. If Groq is unavailable, the bot
+still responds with a plan-aware setup prompt.
+
+
 ---
 
 ## ⚙️ Setup & Installation
@@ -75,6 +88,8 @@ SUPABASE_KEY=your_supabase_key_here   # Server-side service_role key (keep priva
 SUPER_ADMIN_ID=123456789              # Your Telegram user ID
 RAZORPAY_KEY_ID=optional_key          # For automated INR payments
 RAZORPAY_KEY_SECRET=optional_secret
+GROQ_API_KEY=your_groq_api_key_here  # Optional; enables conversational support
+GROQ_MODEL=llama-3.3-70b-versatile   # Optional model override
 ```
 
 ### 3. Set up Supabase Database
@@ -126,6 +141,8 @@ python3 -m bot.main
 | `/help` | Interactive step-by-step image tutorials |
 | `/pro` | View premium subscription plans and purchase |
 | `/plan` | View current trial or subscription status |
+| `/ask` or `/agent` | Start a conversational support/setup session |
+| Private text | Ask the agent a question directly |
 
 
 ## Reliability update and verification
