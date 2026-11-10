@@ -53,12 +53,13 @@ Add `GROQ_API_KEY` to `.env` to enable Groq replies. Users can send `/ask` or `/
 the problem; ordinary private text messages are also handled. The agent reads the user's current role
 and subscription state:
 
-- Free users receive short general guidance and `/pro` for paid-only forwarding setup.
-- Active paid users can say “add my channel”, “add a target”, “add a filter”, or “schedule a message”.
-  The bot automatically opens the matching interactive command and channel picker.
+- Free users receive short general guidance; paid-only requests get `That feature needs Premium. Use /pro to upgrade.`
+- Active paid users can say “add my channel”, “add a target”, “add a filter”, “show my filters”, “check
+  my status”, “stop forwarding”, or “schedule a message”. The bot opens the matching interactive command.
+- Agent replies are limited to three short lines. If Groq is unavailable, setup phrases still run the matching
+  command; other messages receive a short fallback.
 
-`GROQ_MODEL` is optional and defaults to `llama-3.3-70b-versatile`. If Groq is unavailable, paid setup
-phrases still open the matching command; other messages receive a short fallback.
+`GROQ_MODEL` is optional and defaults to `llama-3.3-70b-versatile`.
 
 
 ---

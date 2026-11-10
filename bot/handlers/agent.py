@@ -18,7 +18,7 @@ from bot.utils.roles import is_admin_active
 logger = logging.getLogger(__name__)
 _HISTORY_KEY = "support_agent_history"
 _MAX_HISTORY_MESSAGES = 12
-_MAX_REPLY_CHARS = 4000
+_MAX_REPLY_CHARS = 700
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -60,8 +60,8 @@ def _account_context(user_id: int, user: dict) -> str:
 
 def _fallback_answer(paid: bool) -> str:
     if paid:
-        return "Tell me what to do: add a source, add a target, create a filter, or schedule a message."
-    return "Tell me what you need. Forwarding setup requires a paid plan. Use /pro to upgrade."
+        return "What do you need: source, target, filter, schedule, or forwarding?"
+    return "That setup needs Premium. Use /pro to upgrade."
 
 
 def _is_paid(user_id: int, user: dict) -> bool:
@@ -69,8 +69,28 @@ def _is_paid(user_id: int, user: dict) -> bool:
 
 
 def _detect_setup_command(text: str) -> str | None:
-    """Map common setup phrases to the existing interactive bot commands."""
+    """Map common requests to the existing interactive bot commands."""
     value = re.sub(r"\s+", " ", text.lower()).strip()
+    if re.search(r"\b(upgrade|premium|paid plan|buy|purchase)\b", value):
+        return "/pro"
+    if re.search(r"\b(plan|trial|subscription|expiry|expire)\b", value):
+        return "/plan"
+    if re.search(r"\b(my filters|show filters|list filters)\b", value):
+        return "/myfilters"
+    if re.search(r"\b(remove|delete)\b.*\b(schedule|scheduled)\b", value):
+        return "/removeschedule"
+    if re.search(r"\b(remove|delete)\b.*\b(target|destination)\b", value):
+        return "/removetarget"
+    if re.search(r"\b(remove|delete)\b.*\b(source|channel)\b", value):
+        return "/removesource"
+    if re.search(r"\b(stop|pause) forwarding\b", value):
+        return "/stop"
+    if re.search(r"\b(start|resume) forwarding\b", value):
+        return "/work"
+    if re.search(r"\b(status|connection|connected|logged in)\b", value):
+        return "/mystatus"
+    if re.search(r"\b(authorize|authorise|login|log in|link my account)\b", value):
+        return "/authorize"
     if re.search(r"\b(source|from channel|copy from|monitor)\b", value):
         return "/addsource"
     if (
@@ -84,11 +104,18 @@ def _detect_setup_command(text: str) -> str | None:
         return "/filter"
     if re.search(r"\b(schedule|scheduled|daily message)\b", value):
         return "/schedule"
-    if re.search(r"\b(authorize|authorise|login|log in|link my account)\b", value):
-        return "/authorize"
-    if re.search(r"\b(start|resume) forwarding\b", value):
-        return "/work"
+    if value in {"help", "help me", "commands", "menu"}:
+        return "/help"
     return None
+
+
+def _compact_reply(answer: str) -> str:
+    """Keep model output useful in a Telegram chat instead of essay-like."""
+    lines = [line.strip() for line in answer.strip().splitlines() if line.strip()]
+    compact = "\n".join(lines[:3])
+    if len(compact) > _MAX_REPLY_CHARS:
+        compact = compact[:_MAX_REPLY_CHARS].rsplit(" ", 1)[0].rstrip() + "…"
+    return compact or "Tell me what you need help with."
 
 
 async def _run_internal_command(
@@ -128,10 +155,7 @@ async def _get_user(update: Update) -> dict | None:
 async def start_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Start a fresh conversation and explicitly ask for the user's problem."""
     context.user_data.pop(_HISTORY_KEY, None)
-    await update.effective_message.reply_text(
-        "I’m ready to help with your Auto Forward Bot setup.\n\n"
-        "What problem are you trying to solve? Tell me what you want to forward or configure."
-    )
+    await update.effective_message.reply_text("What do you need help with?")
 
 
 async def handle_agent_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -147,9 +171,19 @@ async def handle_agent_message(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = update.effective_user.id
     paid = _is_paid(user_id, user)
     command = _detect_setup_command(message.text)
-    if paid and command:
+    if command == "/mystatus" and not paid:
+        command = "/plan"
+    paid_only = {
+        "/authorize", "/addsource", "/addtarget", "/filter", "/myfilters",
+        "/schedule", "/removesource", "/removetarget", "/removeschedule",
+        "/mystatus", "/work", "/stop",
+    }
+    if command:
         context.user_data.pop(_HISTORY_KEY, None)
-        await _run_internal_command(update, context, command)
+        if command in paid_only and not paid:
+            await message.reply_text("That feature needs Premium. Use /pro to upgrade.")
+        else:
+            await _run_internal_command(update, context, command)
         return
     history = context.user_data.setdefault(_HISTORY_KEY, [])
     history.append({"role": "user", "content": message.text.strip()})
@@ -165,7 +199,7 @@ async def handle_agent_message(update: Update, context: ContextTypes.DEFAULT_TYP
     except AgentUnavailable:
         answer = _fallback_answer(paid)
 
-    answer = answer[:_MAX_REPLY_CHARS]
+    answer = _compact_reply(answer)
     history.append({"role": "assistant", "content": answer})
     history[:] = history[-_MAX_HISTORY_MESSAGES:]
     await message.reply_text(answer)

@@ -15,7 +15,13 @@ os.environ.update(
     GROQ_API_KEY="",
 )
 
-from bot.handlers.agent import _account_context, _detect_setup_command, _fallback_answer, _is_paid
+from bot.handlers.agent import (
+    _account_context,
+    _compact_reply,
+    _detect_setup_command,
+    _fallback_answer,
+    _is_paid,
+)
 from bot.utils.groq_agent import build_system_prompt
 
 
@@ -51,7 +57,7 @@ class AgentHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         from bot.handlers.agent import handle_agent_message
 
-        message = SimpleNamespace(text="How do I add a source?", reply_text=AsyncMock())
+        message = SimpleNamespace(text="What can I do?", reply_text=AsyncMock())
         update = SimpleNamespace(
             effective_message=message,
             effective_chat=SimpleNamespace(type="private", id=22),
@@ -71,6 +77,34 @@ class AgentHandlerTests(unittest.IsolatedAsyncioTestCase):
         prompt = ask.await_args.args[0][0]["content"]
         self.assertIn("Access mode: free", prompt)
 
+    async def test_free_setup_request_gets_short_upgrade_reply(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+
+        from bot.handlers.agent import handle_agent_message
+
+        message = SimpleNamespace(text="Help me add a target", reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_message=message,
+            effective_chat=SimpleNamespace(type="private", id=22),
+            effective_user=SimpleNamespace(id=22, username="free_user"),
+        )
+        context = SimpleNamespace(user_data={}, bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        free_user = {"role": "user", "trial_start": None, "subscription_end": None}
+
+        with patch("bot.handlers.agent.users_db.get_or_create_user", return_value=free_user), \
+             patch("bot.handlers.agent.ask_agent", new=AsyncMock()) as ask:
+            await handle_agent_message(update, context)
+
+        self.assertEqual(message.reply_text.await_args.args[0], "That feature needs Premium. Use /pro to upgrade.")
+        ask.assert_not_awaited()
+
+    def test_common_phrases_map_to_real_commands(self):
+        self.assertEqual(_detect_setup_command("show my filters"), "/myfilters")
+        self.assertEqual(_detect_setup_command("stop forwarding"), "/stop")
+        self.assertEqual(_detect_setup_command("I want to upgrade"), "/pro")
+        self.assertEqual(_detect_setup_command("what is my status"), "/mystatus")
+        self.assertEqual(_compact_reply("one\n\n two\nthree\nfour"), "one\ntwo\nthree")
     async def test_paid_setup_phrase_runs_target_conversation(self):
         from types import SimpleNamespace
         from unittest.mock import AsyncMock, patch

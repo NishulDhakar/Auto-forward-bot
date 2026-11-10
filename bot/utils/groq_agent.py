@@ -41,7 +41,7 @@ def _request(messages: list[dict[str, str]]) -> str:
         "model": GROQ_MODEL,
         "messages": messages,
         "temperature": 0.2,
-        "max_tokens": 700,
+        "max_tokens": 250,
     }).encode("utf-8")
     request = urllib.request.Request(
         "https://api.groq.com/openai/v1/chat/completions",
