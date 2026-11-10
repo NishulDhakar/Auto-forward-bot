@@ -49,16 +49,16 @@ To forward messages from private channels, the bot securely links to your Telegr
 - Pay via INR (UPI/Razorpay) or Crypto (USDT) and confirm payment directly inside the bot.
 
 ### Conversational support agent
-Add `GROQ_API_KEY` to `.env` to enable the agent. Users can send `/ask` (or `/agent`) and then describe
-their problem; ordinary private text messages are also handled conversationally. The agent reads the
-user's current role and subscription state:
+Add `GROQ_API_KEY` to `.env` to enable Groq replies. Users can send `/ask` or `/agent`, or simply describe
+the problem; ordinary private text messages are also handled. The agent reads the user's current role
+and subscription state:
 
-- Free users receive general guidance and are directed to `/pro` for paid-only forwarding setup.
-- Active paid users receive step-by-step help for `/authorize`, `/addsource`, `/addtarget`, `/filter`,
-  `/schedule`, `/work`, and `/mystatus`.
+- Free users receive short general guidance and `/pro` for paid-only forwarding setup.
+- Active paid users can say “add my channel”, “add a target”, “add a filter”, or “schedule a message”.
+  The bot automatically opens the matching interactive command and channel picker.
 
-`GROQ_MODEL` is optional and defaults to `llama-3.3-70b-versatile`. If Groq is unavailable, the bot
-still responds with a plan-aware setup prompt.
+`GROQ_MODEL` is optional and defaults to `llama-3.3-70b-versatile`. If Groq is unavailable, paid setup
+phrases still open the matching command; other messages receive a short fallback.
 
 
 ---

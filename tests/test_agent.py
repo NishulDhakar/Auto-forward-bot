@@ -15,7 +15,7 @@ os.environ.update(
     GROQ_API_KEY="",
 )
 
-from bot.handlers.agent import _account_context, _fallback_answer, _is_paid
+from bot.handlers.agent import _account_context, _detect_setup_command, _fallback_answer, _is_paid
 from bot.utils.groq_agent import build_system_prompt
 
 
@@ -70,6 +70,42 @@ class AgentHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.reply_text.await_args.args[0], "Use /pro first.")
         prompt = ask.await_args.args[0][0]["content"]
         self.assertIn("Access mode: free", prompt)
+
+    async def test_paid_setup_phrase_runs_target_conversation(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+
+        from telegram import Chat, Message, Update, User
+        from bot.handlers.agent import handle_agent_message
+
+        bot = SimpleNamespace(send_chat_action=AsyncMock())
+        message = Message(
+            message_id=10,
+            date=datetime.now(timezone.utc),
+            chat=Chat(22, "private"),
+            from_user=User(22, "paid_user", False),
+            text="Help me to add my channel",
+        )
+        message.set_bot(bot)
+        update = Update(10, message=message)
+        update.set_bot(bot)
+        context = SimpleNamespace(
+            user_data={},
+            bot=bot,
+            application=SimpleNamespace(process_update=AsyncMock()),
+        )
+        paid_user = {
+            "role": "admin",
+            "subscription_end": (datetime.now(timezone.utc) + timedelta(days=10)).isoformat(),
+            "subscription_plan": "1_month",
+        }
+
+        with patch("bot.handlers.agent.users_db.get_or_create_user", return_value=paid_user):
+            await handle_agent_message(update, context)
+
+        context.application.process_update.assert_awaited_once()
+        synthetic = context.application.process_update.await_args.args[0]
+        self.assertEqual(synthetic.effective_message.text, "/addtarget")
 
 
 if __name__ == "__main__":

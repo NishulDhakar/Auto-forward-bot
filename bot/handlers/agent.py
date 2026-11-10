@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 
-from telegram import Update
+from telegram import Message, MessageEntity, Update
 from telegram.constants import ChatAction
 from telegram.ext import CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -59,19 +60,58 @@ def _account_context(user_id: int, user: dict) -> str:
 
 def _fallback_answer(paid: bool) -> str:
     if paid:
-        return (
-            "I can help you set this up. What are you trying to do: forward messages, add a source, "
-            "add a target, create a filter, or schedule a message? I’ll guide you one step at a time."
-        )
-    return (
-        "Tell me what problem you are trying to solve. I can explain the forwarding workflow and help you "
-        "choose the right feature. Real-time forwarding and setup require an active paid plan; use /pro "
-        "to view the available plans."
-    )
+        return "Tell me what to do: add a source, add a target, create a filter, or schedule a message."
+    return "Tell me what you need. Forwarding setup requires a paid plan. Use /pro to upgrade."
 
 
 def _is_paid(user_id: int, user: dict) -> bool:
     return user_id == SUPER_ADMIN_ID or user.get("role") == "superadmin" or is_admin_active(user)
+
+
+def _detect_setup_command(text: str) -> str | None:
+    """Map common setup phrases to the existing interactive bot commands."""
+    value = re.sub(r"\s+", " ", text.lower()).strip()
+    if re.search(r"\b(source|from channel|copy from|monitor)\b", value):
+        return "/addsource"
+    if (
+        re.search(r"\b(target|destination|receive messages|forward to)\b", value)
+        or "help me to add my channel" in value
+        or "this is my channel" in value
+        or ("add my channel" in value and "source" not in value)
+    ):
+        return "/addtarget"
+    if re.search(r"\b(filter|replace links|block keyword|block apk)\b", value):
+        return "/filter"
+    if re.search(r"\b(schedule|scheduled|daily message)\b", value):
+        return "/schedule"
+    if re.search(r"\b(authorize|authorise|login|log in|link my account)\b", value):
+        return "/authorize"
+    if re.search(r"\b(start|resume) forwarding\b", value):
+        return "/work"
+    return None
+
+
+async def _run_internal_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    command: str,
+) -> None:
+    """Feed a detected command through the real ConversationHandler."""
+    message = update.effective_message
+    synthetic_message = Message(
+        message_id=message.message_id,
+        date=message.date,
+        chat=message.chat,
+        from_user=message.from_user,
+        text=command,
+        entities=[MessageEntity(MessageEntity.BOT_COMMAND, 0, len(command))],
+    )
+    synthetic_message.set_bot(context.bot)
+    synthetic_update = Update(update.update_id, message=synthetic_message)
+    synthetic_update.set_bot(context.bot)
+    await context.application.process_update(synthetic_update)
+
+
 
 
 async def _get_user(update: Update) -> dict | None:
@@ -106,6 +146,11 @@ async def handle_agent_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     user_id = update.effective_user.id
     paid = _is_paid(user_id, user)
+    command = _detect_setup_command(message.text)
+    if paid and command:
+        context.user_data.pop(_HISTORY_KEY, None)
+        await _run_internal_command(update, context, command)
+        return
     history = context.user_data.setdefault(_HISTORY_KEY, [])
     history.append({"role": "user", "content": message.text.strip()})
     history[:] = history[-_MAX_HISTORY_MESSAGES:]
